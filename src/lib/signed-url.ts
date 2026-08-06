@@ -50,6 +50,15 @@ function b64urlDecode(s: string): Buffer | null {
 export interface WalletPassPayload {
   txnId: string;
   qrCodeId?: string;
+  /**
+   * Discriminator — 'wallet_pass' on every token minted from now on.
+   *
+   * Optional because tokens minted before this field existed are still in
+   * customers' WhatsApp threads for up to the 30-day TTL below. Those decode
+   * with `purpose === undefined` and are accepted; see verifyWalletPassToken.
+   * Once the last pre-change token has expired this can become required.
+   */
+  purpose?: 'wallet_pass';
   /** Unix milliseconds. */
   exp: number;
 }
@@ -67,6 +76,7 @@ export function signWalletPassToken(
   const payload: WalletPassPayload = {
     txnId: input.txnId,
     qrCodeId: input.qrCodeId,
+    purpose: 'wallet_pass',
     exp: Date.now() + ttl * 1000,
   };
   const payloadStr = JSON.stringify(payload);
@@ -101,6 +111,13 @@ export function verifyWalletPassToken(token: string): WalletPassPayload | null {
   }
   if (!payload?.txnId || typeof payload.exp !== 'number') return null;
   if (payload.exp <= Date.now()) return null;
+  // Reject tokens minted for a DIFFERENT purpose. Wallet-view tokens carry the
+  // same `txnId` + `exp` shape and are signed with the same secret, so without
+  // this check a leaked /w/[token] view link — 90-day TTL, handed straight to
+  // the customer — also unlocked the door-scannable pass PDF for triple the
+  // intended window. `undefined` is still accepted for the pre-change tokens
+  // described on the payload type.
+  if (payload.purpose !== undefined && payload.purpose !== 'wallet_pass') return null;
   return payload;
 }
 
@@ -114,9 +131,13 @@ export function verifyWalletPassToken(token: string): WalletPassPayload | null {
 // leaked pass URL — which we treat as low-risk because all it does is render
 // a PNG — would also grant read access to the wallet balance + the ability
 // to call /topup. The `purpose` discriminator below makes the two token
-// classes non-interchangeable: verifyWalletViewToken returns null on a
-// pass token, and verifyWalletPassToken would never match this payload
-// shape's signature anyway (different HMAC input).
+// classes non-interchangeable, but ONLY because both verifiers check it.
+// An earlier version of this comment claimed verifyWalletPassToken "would
+// never match this payload shape's signature anyway (different HMAC input)"
+// — that was wrong. Both classes are signed with the same secret, and a
+// view token is a perfectly valid signature over its OWN payload; since
+// that payload also carries `txnId` and `exp`, it sailed through the pass
+// verifier until it grew the explicit purpose check.
 //
 // TTL default 90 days — longer than pass image (30d) because customers may
 // keep this URL open as a "card" they revisit through the night/event.

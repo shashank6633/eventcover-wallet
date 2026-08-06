@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllConfig, setConfig } from '@/lib/db';
+import { getSession } from '@/lib/auth';
 import { logAudit } from '@/lib/audit';
 
 export const runtime = 'nodejs';
@@ -41,6 +42,15 @@ const EDITABLE_KEYS = new Set([
   'WALLET_PASS_TEMPLATE_LANG',
   'WALLET_PASS_TEMPLATE_INCLUDE_LINK',
   'WALLET_VIEW_TOKEN_TTL_DAYS',
+  // Tiers 2 & 3 — paid ticket / cover pass delivered as a PDF with the entry
+  // QR. Two template names because the variable counts differ (4 vs 2).
+  'WALLET_PASS_PDF_TEMPLATE',
+  'WALLET_PASS_PDF_TEMPLATE_ENTRY',
+  'WALLET_PASS_PDF_LANG',
+  // Tier 1 — free reservation confirmation, text only (no QR, no attachment).
+  'AUTO_SEND_RESERVATION_CONFIRM',
+  'RESERVATION_CONFIRM_TEMPLATE',
+  'RESERVATION_CONFIRM_LANG',
   // Razorpay payment gateway (host-only sub-page)
   'RAZORPAY_MODE',
   'RAZORPAY_KEY_ID',
@@ -82,9 +92,36 @@ const SENSITIVE_KEYS = new Set([
   'INTERNAL_TOKEN_SECRET',  // HMAC key for signed URLs — never exposed
   'RAZORPAY_KEY_SECRET',
   'RAZORPAY_WEBHOOK_SECRET',
+  // Session-cookie signing key. Leaking this is a full authentication bypass:
+  // anyone holding it can forge a host session and then reveal wallet PINs,
+  // void wallets, and rewrite payment credentials. It is NOT in EDITABLE_KEYS,
+  // so it can only ever be read — which is exactly how it escaped notice.
+  'SESSION_SECRET',
   // Settings V2 — bank account number is sensitive; mask in GET responses
   'BANK_ACCOUNT_NUMBER',
 ]);
+
+/**
+ * Keys whose NAME trips the heuristic below but whose value is genuinely
+ * public. Keep this list short and justify every entry.
+ */
+const PUBLIC_DESPITE_NAME = new Set([
+  'RAZORPAY_KEY_ID',            // publishable id — rendered into the checkout page
+  'WALLET_VIEW_TOKEN_TTL_DAYS', // a TTL in days, not a credential
+]);
+
+/**
+ * SENSITIVE_KEYS alone is a deny-list, and a deny-list fails open: every new
+ * secret is exposed in plaintext until somebody remembers to add it here.
+ * That is precisely how SESSION_SECRET came to be served to anonymous
+ * callers. The name heuristic is the backstop, so the default for a
+ * secret-shaped key is masked rather than public.
+ */
+function isSensitive(key: string): boolean {
+  if (SENSITIVE_KEYS.has(key)) return true;
+  if (PUBLIC_DESPITE_NAME.has(key)) return false;
+  return /SECRET|TOKEN|PASSWORD|PRIVATE|CREDENTIAL/.test(key);
+}
 
 const MASKED = '••••••••';
 
@@ -92,7 +129,7 @@ function safeConfig(): Record<string, string> {
   const all = getAllConfig();
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(all)) {
-    if (SENSITIVE_KEYS.has(k)) {
+    if (isSensitive(k)) {
       out[k] = v ? MASKED : '';
     } else {
       out[k] = v;
@@ -101,11 +138,29 @@ function safeConfig(): Record<string, string> {
   return out;
 }
 
+/**
+ * Read venue config.
+ *
+ * Authenticated: `src/middleware.ts` matches only `['/admin/:path*']`, so an
+ * API route gets no protection from it and must check the session itself.
+ * Every caller of this endpoint is an /admin page; the public site reads the
+ * deliberately narrower /api/branding instead, so gating this breaks nothing
+ * customer-facing.
+ */
 export async function GET() {
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ ok: false, message: 'Not authenticated.' }, { status: 401 });
+  }
   return NextResponse.json({ ok: true, config: safeConfig() });
 }
 
 export async function POST(req: NextRequest) {
+  const session = await getSession();
+  if (!session) {
+    return NextResponse.json({ ok: false, message: 'Not authenticated.' }, { status: 401 });
+  }
+
   const body = await req.json();
   const updates = body?.updates;
   if (!updates || typeof updates !== 'object') {
@@ -119,14 +174,16 @@ export async function POST(req: NextRequest) {
     const v = value == null ? '' : String(value);
     // Posting back the masked placeholder must NOT overwrite the real secret.
     // The Settings UI sends '••••••••' when the field wasn't edited.
-    if (SENSITIVE_KEYS.has(key) && v === MASKED) { continue; }
+    if (isSensitive(key) && v === MASKED) { continue; }
     setConfig(key, v);
     // Never echo a sensitive value back in the response — only acknowledge it
     // was set.
-    applied[key] = SENSITIVE_KEYS.has(key) ? (v ? MASKED : '') : v;
+    applied[key] = isSensitive(key) ? (v ? MASKED : '') : v;
   }
 
-  logAudit({ actor: 'admin', action: 'config_update', details: applied });
+  // Real actor, not a hardcoded 'admin' — config writes include payment
+  // credentials, so "who changed this" has to be answerable.
+  logAudit({ actor: session.name || 'admin', action: 'config_update', details: applied });
 
   return NextResponse.json({
     ok: true,
