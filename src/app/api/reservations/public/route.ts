@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { nanoid } from 'nanoid';
 import crypto from 'crypto';
-import { getDb } from '@/lib/db';
+import { getDb, getConfig } from '@/lib/db';
 import { logAudit } from '@/lib/audit';
 import { normalizePhone } from '@/lib/users';
 import type { EventRow } from '@/lib/events';
@@ -12,11 +12,13 @@ import { getZone } from '@/lib/seating-layout';
 import {
   getEffectivePixelId,
   getCapiAccessToken,
+  getTestEventCode,
   hashSha256Lowercase,
   normalizePhoneForCapi,
-  sendCapiEvent,
+  sendCapiEventAudited,
 } from '@/lib/meta-pixel';
 import { sendBookingAlertWhatsApp } from '@/lib/notifications';
+import { sendReservationConfirmWhatsApp } from '@/lib/whatsapp/reservation-confirm-send';
 
 // ─── Constant-time invite secret compare ───────────────────────────────────
 // Length-mismatch short-circuit is fine — leaking the length of a
@@ -396,29 +398,48 @@ export async function POST(req: NextRequest) {
   const pixelId = getEffectivePixelId(event.meta_pixel_id);
   const accessToken = getCapiAccessToken();
   if (pixelId && accessToken) {
-    const phoneHash = hashSha256Lowercase(normalizePhoneForCapi(phone));
-    // Don't await — Meta's API can be slow and the customer is waiting on
-    // their confirmation. Errors are swallowed; we'd see them in CAPI's
-    // Test Events tab during diagnostic runs.
-    sendCapiEvent({
-      pixelId,
-      accessToken,
-      eventName: 'Lead',
-      eventId: reservationId,
-      actionSource: 'website',
-      userData: {
-        ph: [phoneHash],
-        fbp: fbp || undefined,
-        fbc: fbc || undefined,
-        client_ip_address: ip !== 'unknown' ? ip : undefined,
-        client_user_agent: req.headers.get('user-agent') || undefined,
+    const digits = normalizePhoneForCapi(phone);
+    // Still not awaited — Meta can be slow and the guest is waiting on their
+    // confirmation. What changed is that the outcome is no longer thrown away:
+    // the previous `.catch(() => {})` caught nothing (sendCapiEvent resolves
+    // with { ok: false } rather than throwing), so a rejected token or a bad
+    // pixel id left no trace anywhere. The old comment claimed failures would
+    // show in CAPI's Test Events tab, but that only happens when
+    // META_TEST_EVENT_CODE is set — and it is empty in the live config, so in
+    // practice nothing was observable at all.
+    sendCapiEventAudited(
+      {
+        pixelId,
+        accessToken,
+        eventName: 'Lead',
+        eventId: reservationId,
+        actionSource: 'website',
+        testEventCode: getTestEventCode() || undefined,
+        userData: {
+          // Hashing an empty string yields a valid hash that matches nobody and
+          // costs match quality — omit instead.
+          ph: digits ? [hashSha256Lowercase(digits)] : undefined,
+          fbp: fbp || undefined,
+          fbc: fbc || undefined,
+          client_ip_address: ip !== 'unknown' ? ip : undefined,
+          client_user_agent: req.headers.get('user-agent') || undefined,
+        },
+        customData: {
+          content_name: event.name,
+          currency: 'INR',
+          value: 0,
+        },
       },
-      customData: {
-        content_name: event.name,
-        currency: 'INR',
+      {
+        actor: 'public-web',
+        entityType: 'reservation',
+        entityId: reservationId,
+        eventName: 'Lead',
+        eventId: reservationId,
+        pixelId,
         value: 0,
       },
-    }).catch(() => { /* never block on Meta */ });
+    );
   }
 
   // ── Fire host WhatsApp booking alert (fire-and-forget) ──
@@ -434,6 +455,28 @@ export async function POST(req: NextRequest) {
     eventName: event.name,
     amount: entryFeeForAlert * pax,
   }).catch(() => { /* never block on host alert */ });
+
+  // ── Tier 1: guest reservation confirmation (fire-and-forget) ──────────
+  // TEXT ONLY — no PDF, no QR. Nothing has been paid at this point: the row
+  // was just inserted as 'pending'. Attaching a pass here would hand the
+  // guest an artifact implying an entitlement they haven't bought, and door
+  // staff would start scanning codes that grant nothing. They get their name,
+  // the event, and a booking ref to quote; the paid pass (tiers 2/3) is sent
+  // from /api/payments/verify once money actually lands.
+  //
+  // Gated OFF by default: on a paid event the guest goes straight on to
+  // checkout, so an operator who enables this will see this message followed
+  // by the pass — that trade-off is theirs to make, hence a config flag and
+  // not a hardcoded send. Not awaited; the customer is waiting on this
+  // response and Interakt latency must never sit in front of it. Every
+  // outcome is audited inside the helper, which never throws.
+  const autoConfirm = getConfig('AUTO_SEND_RESERVATION_CONFIRM', '0').trim();
+  if (autoConfirm === '1' || autoConfirm.toLowerCase() === 'true') {
+    sendReservationConfirmWhatsApp({
+      reservationId,
+      actor: 'public',
+    }).catch(() => { /* logged via audit; never block the booking response */ });
+  }
 
   return NextResponse.json({
     ok: true,

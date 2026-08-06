@@ -840,13 +840,19 @@ export function PublicBookingForm({
       return null;
     }
 
-    // Fire Pixel Lead client-side (server-side CAPI Lead fires too, deduped
-    // by event_id on the backend).
-    fireMetaEvent('Lead', {
-      content_name: eventName,
-      currency: 'INR',
-      value: 0,
-    });
+    // Fire Pixel Lead client-side. /api/reservations/public fires a CAPI Lead
+    // for the same booking using `reservationId` as its event_id, so passing
+    // the same id here is what actually makes the pair dedupe — without it
+    // Meta treats them as two separate leads.
+    fireMetaEvent(
+      'Lead',
+      {
+        content_name: eventName,
+        currency: 'INR',
+        value: 0,
+      },
+      json.reservationId || undefined,
+    );
 
     return json.reservationId || null;
   }
@@ -1007,12 +1013,23 @@ export function PublicBookingForm({
         );
         return;
       }
-      // Fire Pixel Purchase event on verified success.
-      fireMetaEvent('Purchase', {
-        value: amountRupees,
-        currency: 'INR',
-        content_name: eventName,
-      });
+      // Fire Pixel Purchase on verified success.
+      //
+      // The dedup key is the Razorpay payment id: the browser has it here from
+      // the checkout response, and /api/payments/verify receives the identical
+      // value as `razorpayPaymentId` and uses it as the CAPI event_id. It is
+      // unique per payment and stable across both sides, which is exactly what
+      // Meta needs to collapse the Pixel event and the server event into one
+      // conversion instead of counting the sale twice.
+      fireMetaEvent(
+        'Purchase',
+        {
+          value: amountRupees,
+          currency: 'INR',
+          content_name: eventName,
+        },
+        resp.razorpay_payment_id || undefined,
+      );
       setStatus({
         kind: 'success',
         message: 'Booking confirmed! Cover pass sent to your WhatsApp.',

@@ -41,11 +41,23 @@ export default function WhatsAppSettingsPage() {
   const [businessPhone, setBusinessPhone] = useState('');
   /** When true, OTP_PROVIDER is set to 'whatsapp' (Interakt). When false, falls back to 'console'. */
   const [useWhatsAppForOtp, setUseWhatsAppForOtp] = useState(false);
-  /** When true, AUTO_SEND_WHATSAPP_PASS is set to '1'. Wallet PNG passes are
-   *  pushed to customers' WhatsApp the moment door staff issue them. */
+  /** When true, AUTO_SEND_WHATSAPP_PASS is set to '1'. Drives tiers 2 and 3
+   *  (paid ticket / cover pass) — a PDF with the entry QR, pushed the moment
+   *  the wallet is issued. */
   const [autoSendPass, setAutoSendPass] = useState(false);
   const [passTemplate, setPassTemplate] = useState('akan_cover_pass');
   const [passTemplateLang, setPassTemplateLang] = useState('en');
+  // Tier 2/3 PDF templates. Two names because the variable counts differ —
+  // cover carries 4 ({{1}} name, {{2}} event, {{3}} amount, {{4}} PIN) and
+  // entry-only carries 2. Meta silently drops a message whose value count
+  // doesn't match the approved template, so they cannot share one name.
+  const [pdfTemplate, setPdfTemplate] = useState('akan_cover_pass_pdf');
+  const [pdfTemplateEntry, setPdfTemplateEntry] = useState('');
+  const [pdfLang, setPdfLang] = useState('en');
+  /** Tier 1: free reservations. Text only — no QR, no attachment. */
+  const [autoSendResConfirm, setAutoSendResConfirm] = useState(false);
+  const [resConfirmTemplate, setResConfirmTemplate] = useState('akan_reservation_confirm');
+  const [resConfirmLang, setResConfirmLang] = useState('en');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -94,6 +106,15 @@ export default function WhatsAppSettingsPage() {
       setAutoSendPass(autoVal === '1' || autoVal === 'true');
       setPassTemplate(c.WALLET_PASS_TEMPLATE || 'akan_cover_pass');
       setPassTemplateLang(c.WALLET_PASS_TEMPLATE_LANG || 'en');
+      setPdfTemplate(c.WALLET_PASS_PDF_TEMPLATE || 'akan_cover_pass_pdf');
+      // No `||` fallback: blank is meaningful here — it's what makes the
+      // entry tier refuse to send rather than borrow the cover template.
+      setPdfTemplateEntry(c.WALLET_PASS_PDF_TEMPLATE_ENTRY ?? '');
+      setPdfLang(c.WALLET_PASS_PDF_LANG || 'en');
+      const resVal = (c.AUTO_SEND_RESERVATION_CONFIRM || '0').trim().toLowerCase();
+      setAutoSendResConfirm(resVal === '1' || resVal === 'true');
+      setResConfirmTemplate(c.RESERVATION_CONFIRM_TEMPLATE || 'akan_reservation_confirm');
+      setResConfirmLang(c.RESERVATION_CONFIRM_LANG || 'en');
       setLoaded(true);
     });
     refreshStatus();
@@ -117,10 +138,19 @@ export default function WhatsAppSettingsPage() {
             // Flip the OTP delivery channel together with credentials so the
             // host has one save button for the whole flow.
             OTP_PROVIDER: useWhatsAppForOtp ? 'whatsapp' : 'console',
-            // Wallet pass auto-send (PNG via Interakt with image header)
+            // Tiers 2 & 3 — paid ticket / cover pass, delivered as a PDF.
             AUTO_SEND_WHATSAPP_PASS: autoSendPass ? '1' : '0',
             WALLET_PASS_TEMPLATE: passTemplate.trim() || 'akan_cover_pass',
             WALLET_PASS_TEMPLATE_LANG: passTemplateLang.trim() || 'en',
+            WALLET_PASS_PDF_TEMPLATE: pdfTemplate.trim() || 'akan_cover_pass_pdf',
+            // Intentionally allowed to be empty — see the fail-closed guard in
+            // wallet-pass-pdf-send.ts.
+            WALLET_PASS_PDF_TEMPLATE_ENTRY: pdfTemplateEntry.trim(),
+            WALLET_PASS_PDF_LANG: pdfLang.trim() || 'en',
+            // Tier 1 — free reservation confirmation, text only.
+            AUTO_SEND_RESERVATION_CONFIRM: autoSendResConfirm ? '1' : '0',
+            RESERVATION_CONFIRM_TEMPLATE: resConfirmTemplate.trim() || 'akan_reservation_confirm',
+            RESERVATION_CONFIRM_LANG: resConfirmLang.trim() || 'en',
           },
         }),
       });
@@ -339,15 +369,18 @@ export default function WhatsAppSettingsPage() {
             />
             <div className="flex-1">
               <div className="text-sm font-semibold text-slate-900">
-                Auto-send cover pass on issue
+                Auto-send pass on issue &mdash; paid tickets &amp; cover charges
               </div>
               <div className="text-xs text-slate-500 mt-1">
-                When ON, every wallet issued at the door fires a WhatsApp message
-                to the customer with the PNG cover pass as the message image.
-                Captain scans the QR straight off their phone — no PDF tap-through.
-                Uses your{' '}
-                <span className="font-mono">{passTemplate || 'akan_cover_pass'}</span>
-                {' '}template (image header).
+                When ON, every wallet issued fires a WhatsApp message carrying a
+                PDF pass with the entry QR. Two tiers, chosen automatically:
+                <span className="block mt-1.5">
+                  <strong>Cover charge</strong> (cover &gt; 0) &rarr; PDF + the
+                  redemption PIN in the message text.
+                  <br />
+                  <strong>Entry only</strong> (cover = 0) &rarr; PDF, no PIN
+                  (there is no bar credit to redeem).
+                </span>
               </div>
               {!config.secretMasked && !apiSecret && (
                 <div className="text-[11px] text-amber-700 mt-1.5">
@@ -357,12 +390,137 @@ export default function WhatsAppSettingsPage() {
               {autoSendPass && (
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div>
-                    <label className="label text-xs">Template name</label>
+                    <label className="label text-xs">
+                      Cover template <span className="text-slate-400">(4 variables)</span>
+                    </label>
                     <input
                       className="input font-mono text-sm"
-                      value={passTemplate}
-                      onChange={(e) => setPassTemplate(e.target.value)}
-                      placeholder="akan_cover_pass"
+                      value={pdfTemplate}
+                      onChange={(e) => setPdfTemplate(e.target.value)}
+                      placeholder="akan_cover_pass_pdf"
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                  <div>
+                    <label className="label text-xs">
+                      Entry-only template <span className="text-slate-400">(2 variables)</span>
+                    </label>
+                    <input
+                      className="input font-mono text-sm"
+                      value={pdfTemplateEntry}
+                      onChange={(e) => setPdfTemplateEntry(e.target.value)}
+                      placeholder="akan_entry_pass_pdf"
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                  {!pdfTemplateEntry.trim() && (
+                    <div className="sm:col-span-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                      <strong>Entry-only passes will not send.</strong> They need
+                      their own 2-variable template — the 4-variable cover
+                      template cannot be reused, because Meta silently drops a
+                      message whose value count doesn&apos;t match the approved
+                      body. Until this is set, comps and zero-cover tickets are
+                      skipped and logged, rather than failing invisibly.
+                    </div>
+                  )}
+                  <div>
+                    <label className="label text-xs">PDF language code</label>
+                    <input
+                      className="input font-mono text-sm"
+                      value={pdfLang}
+                      onChange={(e) => setPdfLang(e.target.value)}
+                      placeholder="en"
+                      maxLength={6}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                  <div className="sm:col-span-2 text-[11px] text-slate-500 space-y-1.5">
+                    <div>
+                      Approve both in Interakt with <strong>HEADER = Document</strong>{' '}
+                      (an image header will not carry a PDF — this is a new
+                      approval, not an edit to your existing template):
+                    </div>
+                    <div>
+                      Cover:{' '}
+                      <span className="font-mono">{`Hi {{1}}, your cover pass for {{2}} is attached. Bar credit: {{3}}. Your redemption PIN is {{4}} — keep it private.`}</span>
+                    </div>
+                    <div>
+                      Entry:{' '}
+                      <span className="font-mono">{`Hi {{1}}, your entry pass for {{2}} is attached. Show the QR at the door.`}</span>
+                    </div>
+                  </div>
+                  <div className="sm:col-span-2 border-t border-slate-200 pt-3">
+                    <div className="text-[11px] text-slate-500 mb-2">
+                      The legacy PNG template below is still used by the manual{' '}
+                      <em>resend</em> button on a wallet. It carries no PIN.
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="label text-xs">PNG template (resend)</label>
+                        <input
+                          className="input font-mono text-sm"
+                          value={passTemplate}
+                          onChange={(e) => setPassTemplate(e.target.value)}
+                          placeholder="akan_cover_pass"
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      </div>
+                      <div>
+                        <label className="label text-xs">PNG language code</label>
+                        <input
+                          className="input font-mono text-sm"
+                          value={passTemplateLang}
+                          onChange={(e) => setPassTemplateLang(e.target.value)}
+                          placeholder="en"
+                          maxLength={6}
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </label>
+        </div>
+
+        {/* Tier 1 — free reservation confirmation. Text only, no QR. */}
+        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              className="mt-1 accent-brand-500 cursor-pointer"
+              checked={autoSendResConfirm}
+              onChange={(e) => setAutoSendResConfirm(e.target.checked)}
+              disabled={!config.secretMasked && !apiSecret}
+            />
+            <div className="flex-1">
+              <div className="text-sm font-semibold text-slate-900">
+                Auto-send confirmation &mdash; free reservations
+              </div>
+              <div className="text-xs text-slate-500 mt-1">
+                When ON, a guest who books a table <em>without paying</em> gets a
+                plain text WhatsApp confirmation. No QR and no attachment by
+                design: there is no money on the booking, so there is nothing to
+                redeem. Door staff check them in by name or phone on the Scan
+                page.
+              </div>
+              {!config.secretMasked && !apiSecret && (
+                <div className="text-[11px] text-amber-700 mt-1.5">
+                  Save an Interakt API secret first to enable this toggle.
+                </div>
+              )}
+              {autoSendResConfirm && (
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="label text-xs">
+                      Template name <span className="text-slate-400">(3 variables)</span>
+                    </label>
+                    <input
+                      className="input font-mono text-sm"
+                      value={resConfirmTemplate}
+                      onChange={(e) => setResConfirmTemplate(e.target.value)}
+                      placeholder="akan_reservation_confirm"
                       onClick={(e) => e.stopPropagation()}
                     />
                   </div>
@@ -370,16 +528,16 @@ export default function WhatsAppSettingsPage() {
                     <label className="label text-xs">Language code</label>
                     <input
                       className="input font-mono text-sm"
-                      value={passTemplateLang}
-                      onChange={(e) => setPassTemplateLang(e.target.value)}
+                      value={resConfirmLang}
+                      onChange={(e) => setResConfirmLang(e.target.value)}
                       placeholder="en"
                       maxLength={6}
                       onClick={(e) => e.stopPropagation()}
                     />
                   </div>
                   <div className="sm:col-span-2 text-[11px] text-slate-500">
-                    Approve a template in Interakt with: HEADER=Image, BODY=
-                    <span className="font-mono">{`Hi {{1}}, your cover pass for {{2}} is ready. Show this QR at the door — no PIN needed for scan.`}</span>
+                    Approve in Interakt with <strong>HEADER = None</strong>, BODY={' '}
+                    <span className="font-mono">{`Hi {{1}}, your table for {{2}} is confirmed. Booking reference {{3}}. See you soon!`}</span>
                   </div>
                 </div>
               )}

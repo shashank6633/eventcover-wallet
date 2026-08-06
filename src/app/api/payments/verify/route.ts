@@ -4,7 +4,7 @@ import { logAudit } from '@/lib/audit';
 import { getEvent } from '@/lib/events';
 import { getReservation } from '@/lib/reservations';
 import { issueWallet } from '@/lib/wallet';
-import { sendWalletPassWhatsApp } from '@/lib/whatsapp/wallet-pass-send';
+import { sendWalletPassPdfWhatsApp } from '@/lib/whatsapp/wallet-pass-pdf-send';
 import { verifyCheckoutSignature, refundPayment } from '@/lib/razorpay';
 import { incrementCouponUse, recordCouponRedemption } from '@/lib/coupons';
 import { reserveZoneSeats } from '@/lib/seating-layout';
@@ -12,6 +12,15 @@ import { trackEvent } from '@/lib/event-analytics';
 import { markRecovered as markCartRecovered } from '@/lib/cart-recovery';
 import { sendBookingAlertWhatsApp, sendSaleWebhook } from '@/lib/notifications';
 import { tryTransitionAfterCapture, type PhaseScope } from '@/lib/ticket-phases';
+import {
+  sendCapiEventWithRetry,
+  logCapiResult,
+  getEffectivePixelId,
+  getCapiAccessToken,
+  getTestEventCode,
+  hashSha256Lowercase,
+  normalizePhoneForCapi,
+} from '@/lib/meta-pixel';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -476,11 +485,23 @@ export async function POST(req: NextRequest) {
     }
 
     const entryFee = Number(event.entry_fee_per_person) || 0;
-    // amount was charged in INR rupees; cover is whatever's left after entry.
-    // If amount == entryFee*pax (entry-only checkout for the default flow),
-    // coverIssued falls back to entryFee per issueWallet's default.
+    // amount was charged in INR rupees; cover is whatever's left after the
+    // WHOLE party's entry. Two rules this line has to hold, both money-critical:
+    //
+    //  1. No `|| entryFee` fallback. `Math.max(0, 0)` is 0 and `0 || entryFee`
+    //     silently became entryFee, so a checkout that paid exactly the entry
+    //     total minted a wallet funded with bar credit the venue never sold
+    //     (₹500 per entry-only booking). An entry-only purchase must produce a
+    //     ₹0 redeemable balance. Passing 0 EXPLICITLY also matters: issueWallet
+    //     defaults a NULL/undefined coverIssued to entryFee, so the zero has to
+    //     be a real number, never an omitted field.
+    //  2. entryFee is PER PERSON; totalEntry is what the party actually paid at
+    //     the door. wallets.entry_fee is summed as door revenue by dashboard.ts,
+    //     analytics.ts and cashier.ts, so it must record totalEntry — writing
+    //     the per-person figure under-reported every multi-pax booking by a
+    //     factor of pax (₹1,500 lost on a 4-pax ₹500 booking).
     const totalEntry = entryFee * Math.max(1, Math.floor(Number(reservation.pax) || 1));
-    const coverIssued = Math.max(0, payment.amount - totalEntry) || entryFee;
+    const coverIssued = Math.max(0, payment.amount - totalEntry);
 
     try {
       const result = await issueWallet({
@@ -488,7 +509,8 @@ export async function POST(req: NextRequest) {
         phone: payment.payer_phone || reservation.phone,
         email: payment.payer_email || reservation.email || undefined,
         pax: reservation.pax || 1,
-        entryFee,
+        // Door money COLLECTED (per-person × pax) — see the totalEntry comment.
+        entryFee: totalEntry,
         coverIssued,
         paymentMethod: 'online',
         issuedBy: 'public-web',
@@ -496,20 +518,48 @@ export async function POST(req: NextRequest) {
         reservationId: reservation.id,
       });
       issuedTxnId = result.txnId;
-      walletMessage = 'Payment confirmed. Your cover pass is on the way.';
+      // Say only what is true at the moment we say it. This used to promise
+      // "Your cover pass is on the way." immediately after issueWallet and
+      // return it regardless of the fire-and-forget send below — and that send
+      // silently skips whenever AUTO_SEND_WHATSAPP_PASS is off (it is off in
+      // the live config today), Interakt is unconfigured, the wallet has no
+      // phone, or the entry-only template is missing. The reference always
+      // works at the door, so this sentence is true on every path; the pass, if
+      // it goes out, is a bonus rather than a promise.
+      walletMessage = `Payment confirmed. Reference ${result.txnId} — show this at the door.`;
 
       db.prepare(`UPDATE payments SET txn_id = ?, updated_at = ? WHERE id = ?`)
         .run(result.txnId, Date.now(), payment.id);
 
-      // Fire-and-forget WhatsApp send. We don't await — sending can take
-      // seconds and the customer is waiting on the verify response.
-      const origin = req.headers.get('origin')
-        || req.headers.get('x-forwarded-host')
-        || req.nextUrl.origin;
-      sendWalletPassWhatsApp({
+      // Fire-and-forget WhatsApp send of the PDF pass. We don't await —
+      // sending can take seconds and the customer is waiting on the verify
+      // response.
+      //
+      // result.pin is the plaintext PIN, in memory only here (issueWallet
+      // hashes it before returning and never stores it in the clear). We pass
+      // it unconditionally: the sender uses it only for a cover wallet, where
+      // it is REQUIRED (shipping a 4-variable template with 3 values is
+      // accepted by Interakt and then silently dropped by Meta), and ignores it
+      // for an entry-only wallet, which coverIssued === 0 now legitimately
+      // produces when the customer paid exactly the entry total. The PIN goes
+      // in the message text only — never on the PDF that carries the QR — so a
+      // forwarded screenshot alone can't drain the bar credit.
+      //
+      // ORIGIN IS SERVER-DERIVED, NEVER A REQUEST HEADER. The sender globs this
+      // straight onto a freshly minted, valid wallet_pass token
+      // (`${origin}/api/public/wallet-pass-pdf/${token}`) and hands the result
+      // to Interakt, whose fetcher then GETs it server-side. Reading it from
+      // the caller-supplied `Origin` / `x-forwarded-host` headers — as this did
+      // — let the payer point a live bearer credential at any host they named,
+      // and shipped the guest a WhatsApp document header for a domain the venue
+      // does not control. req.nextUrl.origin is what /api/tickets and
+      // /api/wallets already use for the same call.
+      const origin = req.nextUrl.origin;
+      sendWalletPassPdfWhatsApp({
         txnId: result.txnId,
-        origin: origin.startsWith('http') ? origin : `https://${origin}`,
+        origin,
         actor: 'public-web',
+        pin: result.pin,
       }).catch(() => { /* never block on WhatsApp */ });
     } catch (err) {
       // Wallet issue failed even though payment captured — log loudly and
@@ -537,9 +587,105 @@ export async function POST(req: NextRequest) {
     walletMessage = 'Deposit received. See you at the event!';
   }
 
+  // ─── Meta CAPI Purchase ───────────────────────────────────────────────────
+  // The paid online booking is the venue's most valuable conversion, and until
+  // now it was reported by the browser Pixel ONLY. That is precisely the traffic
+  // Safari ITP and ad blockers drop, which is the entire reason the Conversions
+  // API exists — so the sales most likely to go unattributed were the ones with
+  // no server-side backup.
+  //
+  // Deliberately NOT gated on the _fbp/_fbc cookies. /api/tickets gates its CAPI
+  // send on them, which is backwards: a visitor with an ad blocker has no such
+  // cookie, fires no Pixel event, and would then be skipped here too — losing
+  // the conversion twice. The cookies are forwarded when present because they
+  // sharpen attribution, but their absence must not suppress the event.
+  //
+  // event_id is the Razorpay payment id, the same value PublicBookingForm hands
+  // to fbq's eventID, so Meta collapses the two into one conversion.
+  await fireCapiPurchase(req, payment, event, paymentId);
+
   return NextResponse.json({
     ok: true,
     message: walletMessage,
     txnId: issuedTxnId,
   });
+}
+
+/**
+ * Report a captured payment to the Meta Conversions API.
+ *
+ * Awaited rather than fire-and-forget: a serverless invocation can be frozen
+ * the moment the response is returned, which silently kills a detached promise
+ * — the failure mode that makes CAPI look "configured but not working". The
+ * cost is one HTTP round trip on a request that has already done several.
+ *
+ * Never throws, and never lets a Meta problem affect the payment response — the
+ * money is already captured and the customer must get their confirmation.
+ */
+async function fireCapiPurchase(
+  req: NextRequest,
+  payment: PaymentRow,
+  event: { name?: string; meta_pixel_id?: string | null } | null | undefined,
+  paymentId: string,
+): Promise<void> {
+  try {
+    const pixelId = getEffectivePixelId(event?.meta_pixel_id);
+    const accessToken = getCapiAccessToken();
+    if (!pixelId || !accessToken) return; // not configured — nothing to report
+
+    const fwd = req.headers.get('x-forwarded-for') || '';
+    const clientIp = fwd.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined;
+
+    const phone = (payment.payer_phone || '').trim();
+    const digits = normalizePhoneForCapi(phone);
+
+    // Retried: this is the paid-sale conversion, the single most valuable event
+    // the venue reports. A retry only costs time when a send is already failing
+    // — a healthy send is one request, unchanged.
+    const result = await sendCapiEventWithRetry({
+      pixelId,
+      accessToken,
+      eventName: 'Purchase',
+      eventId: paymentId,
+      actionSource: 'website',
+      testEventCode: getTestEventCode() || undefined,
+      userData: {
+        // Only send a hash when there is something real to hash: hashing '' is
+        // a valid SHA-256 that matches no human, and Meta scores a payload of
+        // never-matching identifiers as poor-quality.
+        ph: digits ? [hashSha256Lowercase(digits)] : undefined,
+        fbp: req.cookies.get('_fbp')?.value || undefined,
+        fbc: req.cookies.get('_fbc')?.value || undefined,
+        client_ip_address: clientIp,
+        client_user_agent: req.headers.get('user-agent') || undefined,
+      },
+      customData: {
+        value: payment.amount,
+        currency: payment.currency || 'INR',
+        content_name: event?.name || 'Event booking',
+        content_ids: [payment.event_id],
+        content_type: 'product',
+      },
+    });
+
+    // Shared with the ticket + reservation call sites so the three cannot
+    // drift apart on action names or redaction rules.
+    logCapiResult(result, {
+      actor: 'public-web',
+      entityType: 'payment',
+      entityId: payment.id,
+      eventName: 'Purchase',
+      eventId: paymentId,
+      pixelId,
+      value: payment.amount,
+    });
+  } catch (err) {
+    logAudit({
+      actor: 'public-web',
+      action: 'meta_capi_purchase_failed',
+      entityType: 'payment',
+      entityId: payment.id,
+      details: { error: err instanceof Error ? err.message : 'unknown', event_id: paymentId },
+    });
+  }
 }

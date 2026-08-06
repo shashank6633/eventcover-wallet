@@ -93,13 +93,31 @@ ${trackCalls}
  * No-ops cleanly on the server or when the pixel snippet was never injected
  * (e.g. event has no configured Pixel ID).
  */
-export function fireMetaEvent(name: string, data?: Record<string, unknown>) {
+export function fireMetaEvent(
+  name: string,
+  data?: Record<string, unknown>,
+  eventId?: string,
+) {
   if (typeof window === 'undefined') return;
   const w = window as unknown as {
     fbq?: (...args: unknown[]) => void;
   };
   if (typeof w.fbq !== 'function') return;
-  if (data) {
+
+  // `eventID` is the ONLY thing that lets Meta recognise a browser event and a
+  // Conversions API event as the same conversion. It rides in fbq's FOURTH
+  // argument — a separate options object, not inside `data`. Omitting it (as
+  // this helper did until now) meant the server could send event_id all it
+  // liked and nothing ever matched: any conversion reported by both the Pixel
+  // and CAPI was counted TWICE in Ads Manager.
+  //
+  // fbq requires the params slot to be present before the options slot, so an
+  // event with an id but no custom data has to pass an empty object.
+  const options = eventId ? { eventID: eventId } : undefined;
+
+  if (options) {
+    w.fbq('track', name, data ?? {}, options);
+  } else if (data) {
     w.fbq('track', name, data);
   } else {
     w.fbq('track', name);

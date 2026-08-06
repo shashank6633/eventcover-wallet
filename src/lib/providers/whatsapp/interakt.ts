@@ -31,6 +31,18 @@ export interface InteraktSendInput {
   /** Values for header variables, if the header has any. */
   headerValues?: string[];
   /**
+   * Display filename for a DOCUMENT header, e.g. "cover-pass-TXN123.pdf".
+   *
+   * Only meaningful when the template's header is DOCUMENT and headerValues[0]
+   * is the PDF URL. WhatsApp shows this string as the attachment caption; when
+   * it's omitted the recipient sees the raw URL slug (a signed token here),
+   * which looks like spam and leaks token shape into the chat transcript.
+   *
+   * Deliberately spread in only when set, so image/text callers keep producing
+   * a byte-identical payload to what Interakt has been accepting all along.
+   */
+  fileName?: string;
+  /**
    * Values for buttons that take variables (e.g. Authentication templates'
    * Copy Code button must receive the OTP code as a parameter).
    * Format: { "<button index>": [value1, value2, ...] }
@@ -88,6 +100,65 @@ export function splitPhone(input: string): { countryCode: string; phoneNumber: s
  *
  * Returns a normalised result — never throws. Caller decides whether to retry.
  */
+/** Mask an arbitrary template variable — keeps its length, drops its content. */
+function maskValue(v: unknown): string {
+  return `«len=${(typeof v === 'string' ? v : String(v)).length}»`;
+}
+
+/**
+ * Mask a header URL. These carry an HMAC-signed token in the last path
+ * segment, and that token IS the credential for the pass artifact — anyone
+ * who reads it out of a log can fetch the guest's door QR. Keep the route
+ * (which is what you actually need to debug a wrong-endpoint bug), drop the
+ * token.
+ */
+function maskUrl(v: unknown): string {
+  const s = typeof v === 'string' ? v : String(v);
+  try {
+    const u = new URL(s);
+    const segs = u.pathname.split('/').filter(Boolean);
+    if (segs.length === 0) return `${u.origin}/`;
+    const tail = segs[segs.length - 1];
+    return `${u.origin}/${segs.slice(0, -1).join('/')}/«token len=${tail.length}»`;
+  } catch {
+    return maskValue(s);
+  }
+}
+
+/**
+ * Redacted copy of the outbound payload, for the diagnostic log below.
+ *
+ * `bodyValues` is a positional, untyped array — this module cannot tell a
+ * guest name from a wallet PIN, and the cover-pass template carries the PIN
+ * in slot 4. That PIN is the single factor gating bar-credit redemption
+ * (see verifyPin + the 3-attempt lockout in redemption.ts), so a plaintext
+ * `[interakt] body:` line is enough to drain a wallet when paired with a
+ * forwarded QR screenshot. Values are therefore masked wholesale rather
+ * than by index — an index-based rule silently stops matching the moment a
+ * template's variable order changes.
+ *
+ * Deliberately still visible, because this is what the log exists to
+ * diagnose: the template name, the language, and the *count* of body values
+ * (an arity mismatch against the Meta-approved template is accepted by
+ * Interakt's schema and then dropped silently at render time).
+ */
+function redactForLog(b: Record<string, unknown>): Record<string, unknown> {
+  const t = (b.template ?? {}) as Record<string, unknown>;
+  const bodyValues = Array.isArray(t.bodyValues) ? t.bodyValues : [];
+  const headerValues = Array.isArray(t.headerValues) ? t.headerValues : [];
+  const phone = String(b.phoneNumber ?? '');
+  return {
+    ...b,
+    phoneNumber: phone.length > 4 ? `…${phone.slice(-4)}` : '…',
+    template: {
+      ...t,
+      headerValues: headerValues.map(maskUrl),
+      bodyValues: bodyValues.map(maskValue),
+      bodyValueCount: bodyValues.length,
+    },
+  };
+}
+
 export async function sendInteraktTemplate(input: InteraktSendInput): Promise<InteraktSendResult> {
   if (!isInteraktConfigured()) {
     return { ok: false, error: 'Interakt not configured. Add API secret in Settings → WhatsApp.' };
@@ -105,6 +176,9 @@ export async function sendInteraktTemplate(input: InteraktSendInput): Promise<In
       headerValues: input.headerValues ?? [],
       bodyValues: input.bodyValues ?? [],
       ...(input.buttonValues ? { buttonValues: input.buttonValues } : {}),
+      // fileName rides alongside a DOCUMENT header URL. Absent for every
+      // existing image/text caller — see the InteraktSendInput doc.
+      ...(input.fileName ? { fileName: input.fileName } : {}),
     },
   };
 
@@ -117,7 +191,7 @@ export async function sendInteraktTemplate(input: InteraktSendInput): Promise<In
   /* eslint-disable no-console */
   console.log(`[interakt] POST ${INTERAKT_ENDPOINT}`);
   console.log(`[interakt] auth: ${auth.slice(0, 10)}… (${secretSummary})`);
-  console.log(`[interakt] body:`, JSON.stringify(body));
+  console.log(`[interakt] body:`, JSON.stringify(redactForLog(body)));
   /* eslint-enable no-console */
 
   let res: Response;
