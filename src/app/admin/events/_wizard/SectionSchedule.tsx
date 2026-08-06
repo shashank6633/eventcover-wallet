@@ -87,6 +87,23 @@ export function SectionSchedule({ state, onChange }: Props) {
         </div>
       </div>
 
+      {/* Recurring flag — display metadata for the customer site, not a scheduler */}
+      <label className="flex items-start gap-2.5 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={state.is_recurring}
+          onChange={(e) => onChange({ is_recurring: e.target.checked })}
+          className="accent-brand-500 w-4 h-4 mt-0.5"
+        />
+        <span>
+          <span className="text-sm font-medium text-slate-800">Recurring event</span>
+          <span className="block text-[11px] text-slate-500">
+            Shows a &ldquo;Recurring&rdquo; chip on the public site. It does not create
+            repeat instances automatically — add each date as its own event.
+          </span>
+        </span>
+      </label>
+
       {/* Slot manager — only renders once the event has been saved */}
       <SlotsManager eventId={eventId} />
     </div>

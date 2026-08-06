@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
+import { soldPaxForEvents, deriveBookingState } from '@/lib/booking-state';
 
 export const runtime = 'nodejs';
 // Keep dynamic since query params drive the filter set, but rely on the
@@ -38,6 +39,21 @@ interface PublicEventListItem {
   venueId: string | null;
   venueName: string | null;
   tags: string[];
+  // ─── Public-site card metadata (akan-events-app contract) ──────────────
+  // Mirrors the detail route's projection so the landing-page grid can
+  // render fully-styled cards without a per-event round-trip.
+  categorySlot: 'day' | 'night' | null;
+  categoryLabel: string | null;
+  tagline: string | null;
+  hue: string;
+  featured: boolean;
+  note: string | null;
+  // Derived availability — the customer app's card CTA reads these directly
+  // rather than re-deriving from status/date/capacity on its side, so both
+  // surfaces always agree on whether an event is bookable.
+  bookingOpen: boolean;
+  bookingStatusLabel: string;
+  isRecurring: boolean;
 }
 
 type Row = {
@@ -53,6 +69,15 @@ type Row = {
   venue_id: string | null;
   venue_name: string | null;
   tags: string | null;
+  category_slot: string | null;
+  category_label: string | null;
+  tagline: string | null;
+  hue: string | null;
+  featured: number | null;
+  note: string | null;
+  status: string;
+  capacity: number | null;
+  is_recurring: number | null;
 };
 
 function isYmd(v: string): boolean {
@@ -116,14 +141,21 @@ export async function GET(req: NextRequest) {
     SELECT
       e.id, e.slug, e.name, e.event_date, e.start_time, e.genre,
       e.card_image, e.image_data, e.one_line_summary, e.venue_id, e.tags,
+      e.category_slot, e.category_label, e.tagline, e.hue, e.featured, e.note,
+      e.status, e.capacity, e.is_recurring,
       v.name AS venue_name
     FROM events e
     LEFT JOIN venues v ON v.id = e.venue_id
     WHERE ${where.join(' AND ')}
-    ORDER BY e.event_date ASC, e.start_time ASC, e.created_at ASC
+    ORDER BY e.featured DESC, e.event_date ASC, e.start_time ASC, e.created_at ASC
     LIMIT ?
   `;
   const rows = db.prepare(sql).all(...params, limit) as Row[];
+
+  // Booked-pax counts for the whole page in ONE grouped query. Doing this
+  // per row would be an N+1 against reservations — at limit=100 that's 100
+  // extra queries per page render.
+  const soldByEvent = soldPaxForEvents(rows.map((r) => r.id));
 
   const events: PublicEventListItem[] = rows.map((r) => ({
     id: r.id,
@@ -138,6 +170,21 @@ export async function GET(req: NextRequest) {
     venueId: r.venue_id,
     venueName: r.venue_name,
     tags: parseTags(r.tags),
+    // Defaults match the detail route so both endpoints agree on how a
+    // legacy (pre-migration) event renders on the customer site.
+    categorySlot: r.category_slot === 'day' || r.category_slot === 'night' ? r.category_slot : null,
+    categoryLabel: r.category_label || null,
+    tagline: r.tagline || null,
+    hue: r.hue || 'sunny',
+    featured: !!r.featured,
+    note: r.note || null,
+    // Shared derivation with the detail route (src/lib/booking-state.ts) so
+    // a card and its detail page never disagree about availability.
+    ...(() => {
+      const s = deriveBookingState(r, soldByEvent.get(r.id) ?? 0);
+      return { bookingOpen: s.booking_open, bookingStatusLabel: s.booking_status_label };
+    })(),
+    isRecurring: !!r.is_recurring,
   }));
 
   const res = NextResponse.json({ ok: true, events, total: events.length });

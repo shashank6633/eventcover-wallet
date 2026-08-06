@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:check": "NEXT_BUILD_DIR=.next-build next build",
     "start": "next start",
     "lint": "next lint"
   },

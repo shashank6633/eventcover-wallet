@@ -86,39 +86,76 @@ export function ReservationQrScanner({ onDetected, onClose, title }: Props) {
         if (cancelled) return;
 
         const Html5Qrcode = mod.Html5Qrcode;
-        const scanner = new Html5Qrcode(containerId, { verbose: false });
+        // useBarCodeDetectorIfSupported hands decoding to the platform's
+        // native BarcodeDetector (Chrome/Android since 83) instead of the
+        // bundled pure-JS zxing fallback. On a mid-range phone that is the
+        // difference between ~1-3s of hunting and a near-instant read — it
+        // is by far the largest win in this file. Silently ignored on
+        // browsers without the API, which then keep the JS path.
+        const scanner = new Html5Qrcode(containerId, {
+          verbose: false,
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        });
         scannerRef.current = scanner;
 
-        const cameras = await Html5Qrcode.getCameras();
-        if (!cameras || cameras.length === 0) {
-          setError('No camera detected. Paste the token manually below.');
-          setStarting(false);
-          return;
-        }
-        const back = cameras.find((c: { label: string }) => /back|rear|environment/i.test(c.label));
-        const cameraId = (back || cameras[0]).id;
+        const scanConfig = {
+          // 10fps left up to 100ms of dead air between decode attempts. With
+          // native detection each pass is cheap, so a higher rate mostly buys
+          // faster acquisition rather than burning CPU.
+          fps: 24,
+          // Was a fixed 260x260 box, which on a large phone is a small target
+          // staff had to line the code up inside — read as "slow" even when
+          // decoding was fast. Sizing off the actual viewfinder gives a
+          // forgiving area on every device. Clamped so it stays sane on very
+          // small or very large viewports.
+          qrbox: (viewW: number, viewH: number) => {
+            const edge = Math.max(200, Math.min(520, Math.floor(Math.min(viewW, viewH) * 0.7)));
+            return { width: edge, height: edge };
+          },
+          aspectRatio: 1,
+        };
 
-        await scanner.start(
-          cameraId,
-          {
-            fps: 10,
-            qrbox: { width: 260, height: 260 },
-            aspectRatio: 1,
-          },
-          (decoded: string) => {
-            if (!startedRef.current) return;
-            const token = extractToken(decoded);
-            if (!token) {
-              setLastMiss(truncate(decoded, 60));
-              return;
-            }
-            setLastMiss(null);
-            safeStop().then(() => onDetectedRef.current(token, decoded));
-          },
-          () => {
-            /* normal "frame without a QR" — ignore */
-          },
-        );
+        const onDecoded = (decoded: string) => {
+          if (!startedRef.current) return;
+          const token = extractToken(decoded);
+          if (!token) {
+            setLastMiss(truncate(decoded, 60));
+            return;
+          }
+          setLastMiss(null);
+          safeStop().then(() => onDetectedRef.current(token, decoded));
+        };
+        const onDecodeFailure = () => {
+          /* normal "frame without a QR" — ignore */
+        };
+
+        // Fast path: hand the browser a facingMode constraint and let it pick
+        // the rear camera itself. The old code called getCameras() first,
+        // which forces a device-enumeration round-trip (and on many phones a
+        // separate permission step) before the camera can even open — 0.5-2s
+        // of dead time on every scan.
+        try {
+          await scanner.start(
+            { facingMode: 'environment' },
+            scanConfig,
+            onDecoded,
+            onDecodeFailure,
+          );
+        } catch {
+          // Fallback: some devices (certain desktops, a few older Androids)
+          // reject the constraint outright. Enumerate and pick the rear lens
+          // by label, exactly as before — slower, but it always worked.
+          const cameras = await Html5Qrcode.getCameras();
+          if (cancelled) return;
+          if (!cameras || cameras.length === 0) {
+            setError('No camera detected. Paste the token manually below.');
+            setStarting(false);
+            return;
+          }
+          const back = cameras.find((c: { label: string }) => /back|rear|environment/i.test(c.label));
+          await scanner.start((back || cameras[0]).id, scanConfig, onDecoded, onDecodeFailure);
+        }
+        if (cancelled) return;
         startedRef.current = true;
         setStarting(false);
       } catch (e) {

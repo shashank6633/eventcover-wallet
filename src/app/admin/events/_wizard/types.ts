@@ -81,6 +81,15 @@ export interface WizardState {
   // category chip. Both null on freshly-created drafts.
   category_slot: CategorySlot | null;
   category_label: string | null;
+  // ─── Public-site metadata (consumed by the customer akan-events-app) ────
+  // These don't affect venue ops — they control how the event renders on
+  // the public events site: card color, featured pinning, badge text, and
+  // the capacity signal that drives "Selling fast" / "Sold out".
+  tagline: string;
+  hue: string;
+  featured: boolean;
+  note: string;
+  capacity: number;
   one_line_summary: string;  // Max 100 chars, shown in event previews + ad previews
   description: string;       // HTML
   slug: string;              // URL-friendly identifier; auto-generated server-side when blank
@@ -93,6 +102,9 @@ export interface WizardState {
   // Schedule
   event_date: string;        // YYYY-MM-DD
   start_time: string;        // "21:30"
+  // Presentational flag only — shows a "Recurring" chip on the public site.
+  // No repeat instances are generated from it.
+  is_recurring: boolean;
 
   // Location
   venue_id: string;
@@ -197,12 +209,18 @@ export const EMPTY_STATE: WizardState = {
   name: '',
   category_slot: null,
   category_label: null,
+  tagline: '',
+  hue: 'sunny',
+  featured: false,
+  note: '',
+  capacity: 0,
   one_line_summary: '',
   description: '',
   image_data: null,
   card_image: null,
   event_date: '',
   start_time: '',
+  is_recurring: false,
   is_public: true,
   artist_ids: [],
   venue_id: '',
@@ -243,11 +261,25 @@ export function hydrateFromEvent(e: Event): WizardState {
   // (and the Event type) after the wizard shipped; older snapshots may not
   // carry them. Treat missing as nulls and let the wizard require them
   // before publish.
-  const ec = e as unknown as { category_slot?: 'day' | 'night' | null; category_label?: string | null };
+  const ec = e as unknown as {
+    category_slot?: 'day' | 'night' | null;
+    category_label?: string | null;
+    tagline?: string | null;
+    hue?: string | null;
+    featured?: boolean | number | null;
+    note?: string | null;
+    capacity?: number | null;
+    is_recurring?: boolean | number | null;
+  };
   return {
     name: e.name,
     category_slot: ec.category_slot === 'day' || ec.category_slot === 'night' ? ec.category_slot : null,
     category_label: ec.category_label || null,
+    tagline: ec.tagline || '',
+    hue: ec.hue || 'sunny',
+    featured: !!ec.featured,
+    note: ec.note || '',
+    capacity: Number(ec.capacity) || 0,
     one_line_summary:
       (e as unknown as { one_line_summary?: string | null }).one_line_summary ?? '',
     description: e.description ?? '',
@@ -256,6 +288,7 @@ export function hydrateFromEvent(e: Event): WizardState {
       (e as unknown as { card_image?: string | null }).card_image ?? null,
     event_date: e.event_date,
     start_time: e.start_time ?? '',
+    is_recurring: !!ec.is_recurring,
     is_public: e.is_public,
     artist_ids: e.artist_ids,
     venue_id: e.venue_id ?? '',

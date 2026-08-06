@@ -29,6 +29,9 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   if ('about' in body) patch.about = body.about ?? null;
   if ('social_url' in body) patch.social_url = body.social_url ?? null;
   if ('image_data' in body) patch.image_data = body.image_data ?? null;
+  if ('vocalists' in body) patch.vocalists = body.vocalists == null ? null : Number(body.vocalists);
+  if ('members' in body) patch.members = body.members == null ? null : Number(body.members);
+  if ('set_minutes' in body) patch.set_minutes = body.set_minutes == null ? null : Number(body.set_minutes);
   if (typeof body.active === 'boolean') patch.active = body.active;
 
   try {

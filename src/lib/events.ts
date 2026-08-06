@@ -147,14 +147,34 @@ export interface EventRow {
   // Both NULL on legacy rows; the wizard requires them before publish.
   category_slot: 'day' | 'night' | null;
   category_label: string | null;
+
+  // ─── akan-events-app public-site metadata ──────────────────────────────
+  // Consumed by the customer-facing Next.js app that proxies this dashboard.
+  // All nullable/defaulted so legacy events keep serializing cleanly.
+  tagline: string | null;
+  hue: string | null;          // one of EVENT_HUES; free text for forward-compat
+  featured: number;            // 0/1 — hydrated to boolean on Event
+  note: string | null;         // badge text e.g. 'Headliner'
+  capacity: number;            // 0 = unlimited
+  is_recurring: number;        // 0/1 — hydrated to boolean on Event
 }
+
+/**
+ * Card color themes the customer site supports. Validated on write; stored
+ * as TEXT so a new palette entry only needs a code change here, not a
+ * migration. Unknown values fall back to 'sunny' at the API projection.
+ */
+export const EVENT_HUES = [
+  'sunny', 'tomato', 'crimson', 'ocean', 'mint', 'lavender', 'slate',
+] as const;
+export type EventHue = (typeof EVENT_HUES)[number];
 
 export interface Event extends Omit<EventRow,
   'pax_rules' | 'artist_ids' | 'tags' | 'booking_types' | 'messages_config' | 'is_public'
   | 'entry_enabled' | 'cover_enabled' | 'table_types' | 'occupancy_rule'
   | 'ticket_design_json' | 'rsvp_fields_json'
   | 'seating_layout_enabled' | 'seating_layout_phases_enabled'
-  | 'gst_enabled'
+  | 'gst_enabled' | 'featured' | 'is_recurring'
 > {
   pax_rules: PaxRule[];
   artist_ids: string[];
@@ -162,6 +182,10 @@ export interface Event extends Omit<EventRow,
   booking_types: BookingType[];
   messages_config: MessagesConfig;
   is_public: boolean;
+  /** Hydrated from the 0/1 column — pinned to the top of its Day/Night rail. */
+  featured: boolean;
+  /** Hydrated from the 0/1 column — drives the customer site's "Recurring" chip. */
+  is_recurring: boolean;
 
   // Pricing engine (hydrated)
   entry_enabled: boolean;
@@ -314,10 +338,18 @@ function hydrate(row: EventRow): Event {
   const occRule: OccupancyRule = row.occupancy_rule === 'min' ? 'min' : 'exact';
   // Strip raw JSON columns from the spread — we expose hydrated counterparts.
   // Also strip gst_enabled so we can re-emit it as boolean below.
-  const { ticket_design_json: _tdj, rsvp_fields_json: _rfj, gst_enabled: _ge, ...rest } = row;
+  // `featured` and `is_recurring` are also stripped so we re-emit them as
+  // booleans below (the columns are 0/1 INTEGERs; the customer app expects
+  // real booleans).
+  const {
+    ticket_design_json: _tdj, rsvp_fields_json: _rfj, gst_enabled: _ge,
+    featured: _feat, is_recurring: _rec, ...rest
+  } = row;
   void _tdj;
   void _rfj;
   void _ge;
+  void _feat;
+  void _rec;
   // Defensive enum coercion — legacy rows may carry NULL when the migration
   // ran without the DEFAULT being applied retroactively (depends on SQLite
   // version). Fall back to 'host' so the calculator never sees an undefined
@@ -336,6 +368,8 @@ function hydrate(row: EventRow): Event {
     booking_types: parseBookingTypes(row.booking_types),
     messages_config: safeJson<MessagesConfig>(row.messages_config, {}),
     is_public: !!row.is_public,
+    featured: !!row.featured,
+    is_recurring: !!row.is_recurring,
     entry_enabled: !!row.entry_enabled,
     cover_enabled: !!row.cover_enabled,
     table_types: parseTableTypes(row.table_types),
@@ -472,6 +506,22 @@ export interface CreateEventInput {
   // ship without a schema change. Pass null to clear (only valid on drafts).
   category_slot?: 'day' | 'night' | null;
   category_label?: string | null;
+
+  // ─── akan-events-app public-site metadata ──────────────────────────────
+  // tagline: short line under the title (max 120 chars, trimmed).
+  // hue: validated against EVENT_HUES; anything else falls back to 'sunny'.
+  // featured: coerced to 0/1.
+  // note: badge text (max 40 chars, trimmed).
+  // capacity: non-negative int; 0 = unlimited.
+  // is_recurring: coerced to 0/1. Presentational only — flags a repeating
+  //   event so the customer site can show a "Recurring" chip; it does NOT
+  //   generate repeat instances.
+  tagline?: string | null;
+  hue?: string | null;
+  featured?: boolean;
+  note?: string | null;
+  capacity?: number | null;
+  is_recurring?: boolean;
 }
 
 export function createEvent(input: CreateEventInput): Event {
@@ -678,6 +728,29 @@ export function updateEvent(id: string, patch: Partial<CreateEventInput>): Event
   if ('category_label' in patch) {
     const lbl = patch.category_label;
     set('category_label', typeof lbl === 'string' && lbl.trim() ? lbl.trim().slice(0, 60) : null);
+  }
+
+  // akan-events-app public-site metadata. Each field independently patchable
+  // so the wizard can save partial state without clobbering the rest.
+  if ('tagline' in patch) {
+    const t = patch.tagline;
+    set('tagline', typeof t === 'string' && t.trim() ? t.trim().slice(0, 120) : null);
+  }
+  if ('hue' in patch) {
+    // Validate against the known palette; unknown values fall back to the
+    // default rather than persisting garbage the customer app can't render.
+    const h = typeof patch.hue === 'string' ? patch.hue.trim().toLowerCase() : '';
+    set('hue', (EVENT_HUES as readonly string[]).includes(h) ? h : 'sunny');
+  }
+  if (patch.featured != null) set('featured', patch.featured ? 1 : 0);
+  if (patch.is_recurring != null) set('is_recurring', patch.is_recurring ? 1 : 0);
+  if ('note' in patch) {
+    const n = patch.note;
+    set('note', typeof n === 'string' && n.trim() ? n.trim().slice(0, 40) : null);
+  }
+  if ('capacity' in patch) {
+    const c = Number(patch.capacity);
+    set('capacity', Number.isFinite(c) && c > 0 ? Math.floor(c) : 0);
   }
 
   if (patch.payment_mode != null) {

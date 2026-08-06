@@ -43,3 +43,11 @@ yarn-error.log
 
 # Local environment files Next.js might emit
 .env*.local
+.next-build
+
+# Generated secrets — must never reach a repo
+docs/*secret*.txt
+docs/*credential*.txt
+
+# Throwaway build dirs from isolated test servers (see next.config.mjs distDir)
+.next-*

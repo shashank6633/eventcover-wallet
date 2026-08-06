@@ -166,6 +166,10 @@ function ArtistForm({ initial, onSave, onCancel }: {
   const [about, setAbout] = useState(initial?.about ?? '');
   const [socialUrl, setSocialUrl] = useState(initial?.social_url ?? '');
   const [imageData, setImageData] = useState<string | null>(initial?.image_data ?? null);
+  // 0 is the stored "not specified" value, so show it as an empty box.
+  const [members, setMembers] = useState(initial?.members ? String(initial.members) : '');
+  const [vocalists, setVocalists] = useState(initial?.vocalists ? String(initial.vocalists) : '');
+  const [setMinutes, setSetMinutes] = useState(initial?.set_minutes ? String(initial.set_minutes) : '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -184,6 +188,9 @@ function ArtistForm({ initial, onSave, onCancel }: {
         about: about.trim() || null,
         social_url: socialUrl.trim() || null,
         image_data: imageData,
+        members: Number(members) || 0,
+        vocalists: Number(vocalists) || 0,
+        set_minutes: Number(setMinutes) || 0,
       };
       const url = isEdit ? `/api/artists/${initial!.id}` : '/api/artists';
       const method = isEdit ? 'PATCH' : 'POST';
@@ -243,6 +250,48 @@ function ArtistForm({ initial, onSave, onCancel }: {
             />
             <div className="mt-1.5 text-xs text-slate-500">
               Shown on the artist card and (eventually) on guest-facing event pages.
+            </div>
+          </div>
+
+          <div>
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="label">Members</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  value={members}
+                  onChange={(e) => setMembers(e.target.value)}
+                  placeholder="—"
+                />
+              </div>
+              <div>
+                <label className="label">Vocalists</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  value={vocalists}
+                  onChange={(e) => setVocalists(e.target.value)}
+                  placeholder="—"
+                />
+              </div>
+              <div>
+                <label className="label">Set length (minutes)</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={0}
+                  value={setMinutes}
+                  onChange={(e) => setSetMinutes(e.target.value)}
+                  placeholder="—"
+                />
+              </div>
+            </div>
+            <div className="mt-1.5 text-xs text-slate-500">
+              Line-up detail for the guest-facing artist profile — how many on stage, how many singing,
+              and how long they play in minutes. Leave blank if it isn&apos;t locked in yet.
             </div>
           </div>
 

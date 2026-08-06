@@ -8,6 +8,9 @@ export interface ArtistRow {
   about: string | null;
   social_url: string | null;
   image_data: string | null;
+  vocalists: number;
+  members: number;
+  set_minutes: number;
   active: number;
   created_at: number;
   created_by: string | null;
@@ -27,7 +30,16 @@ export interface Artist extends Omit<ArtistRow, 'active'> {
 const MAX_IMAGE_BYTES = 1_500_000;
 
 function toArtist(row: ArtistRow): Artist {
-  return { ...row, active: !!row.active };
+  return {
+    ...row,
+    active: !!row.active,
+    // Line-up columns arrived in a later migration, so pre-migration rows can
+    // read back NULL. The customer app types artist_profile counts as plain
+    // numbers, so settle them here instead of making it null-guard each one.
+    vocalists: nonNegInt(row.vocalists),
+    members: nonNegInt(row.members),
+    set_minutes: nonNegInt(row.set_minutes),
+  };
 }
 
 export function listArtists(): Artist[] {
@@ -49,6 +61,9 @@ export interface ArtistInput {
   about?: string | null;
   social_url?: string | null;
   image_data?: string | null;
+  vocalists?: number | null;
+  members?: number | null;
+  set_minutes?: number | null;
 }
 
 export function createArtist(input: ArtistInput, createdBy: string): Artist {
@@ -64,14 +79,19 @@ export function createArtist(input: ArtistInput, createdBy: string): Artist {
   const db = getDb();
   const id = nanoid();
   db.prepare(`
-    INSERT INTO artists (id, name, about, social_url, image_data, active, created_at, created_by)
-    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+    INSERT INTO artists
+      (id, name, about, social_url, image_data, vocalists, members, set_minutes,
+       active, created_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   `).run(
     id,
     name,
     (input.about ?? '').trim() || null,
     social || null,
     image,
+    nonNegInt(input.vocalists),
+    nonNegInt(input.members),
+    nonNegInt(input.set_minutes),
     Date.now(),
     createdBy,
   );
@@ -87,6 +107,9 @@ export interface ArtistPatch {
   about?: string | null;
   social_url?: string | null;
   image_data?: string | null;
+  vocalists?: number | null;
+  members?: number | null;
+  set_minutes?: number | null;
   active?: boolean;
 }
 
@@ -115,6 +138,17 @@ export function updateArtist(id: string, patch: ArtistPatch, actor: string): Art
     validateImageData(img);
     fields.push('image_data = ?'); values.push(img);
   }
+  // Each line-up count patches on its own so an editor that only knows about
+  // one of them never zeroes the other two.
+  if (patch.vocalists !== undefined) {
+    fields.push('vocalists = ?'); values.push(nonNegInt(patch.vocalists));
+  }
+  if (patch.members !== undefined) {
+    fields.push('members = ?'); values.push(nonNegInt(patch.members));
+  }
+  if (patch.set_minutes !== undefined) {
+    fields.push('set_minutes = ?'); values.push(nonNegInt(patch.set_minutes));
+  }
   if (patch.active !== undefined) {
     fields.push('active = ?'); values.push(patch.active ? 1 : 0);
   }
@@ -140,6 +174,15 @@ export function deleteArtist(id: string, actor: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Head-counts and set length are whole, non-negative quantities — a fractional
+ * or negative one is always bad input, and 0 is our "not specified" marker.
+ */
+function nonNegInt(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 function isValidUrl(s: string): boolean {

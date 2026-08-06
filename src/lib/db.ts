@@ -5,8 +5,18 @@ import bcrypt from 'bcryptjs';
 import { nanoid } from 'nanoid';
 import { defaultEventDate } from './expiry';
 
-const DB_DIR = path.join(process.cwd(), 'data');
-const DB_PATH = path.join(DB_DIR, 'eventcover.db');
+// EVENTCOVER_DB_PATH lets a test or audit run point at a throwaway COPY of the
+// database instead of the live one. Unset (the normal case, including
+// production) it resolves to exactly the previous hardcoded path, so this
+// changes nothing at runtime.
+//
+// This exists because there is otherwise no way to exercise a write path —
+// issuing a wallet, redeeming cover — without mutating real venue data. An
+// automated audit did precisely that and left 21 bogus wallets behind.
+const DB_PATH = process.env.EVENTCOVER_DB_PATH
+  ? path.resolve(process.env.EVENTCOVER_DB_PATH)
+  : path.join(process.cwd(), 'data', 'eventcover.db');
+const DB_DIR = path.dirname(DB_PATH);
 
 let _db: Database.Database | null = null;
 
@@ -303,6 +313,30 @@ function initSchema(db: Database.Database) {
     // TTL (days) for the wallet-view HMAC token embedded in the {{3}} URL.
     // Customers keep this link open as a "card" — longer than the pass PNG TTL.
     ['WALLET_VIEW_TOKEN_TTL_DAYS', '90'],
+    // ─── Tier 1: free reservation confirmation (TEXT ONLY, no QR) ─────────
+    // A guest who reserves without paying gets a plain text confirmation.
+    // No QR and no attachment by design: there is no money on the booking,
+    // so there is nothing to redeem and nothing worth protecting. Door staff
+    // check them in by name/phone on /admin/scan.
+    //
+    // Default '0': nothing goes out until the venue has an approved
+    // Interakt template. Flip to '1' after approval.
+    ['AUTO_SEND_RESERVATION_CONFIRM', '0'],
+    ['RESERVATION_CONFIRM_TEMPLATE', 'akan_reservation_confirm'],
+    ['RESERVATION_CONFIRM_LANG', 'en'],
+    // ─── Tiers 2 & 3: paid ticket / cover pass (PDF + QR) ─────────────────
+    // Both ride the AUTO_SEND_WHATSAPP_PASS toggle above. They need TWO
+    // separate approved templates because their variable counts differ, and
+    // Meta silently drops a message whose value count doesn't match:
+    //   cover (tier 3): 4 vars — name, event, amount, PIN
+    //   entry (tier 2): 2 vars — name, event
+    // The entry key is intentionally seeded BLANK. wallet-pass-pdf-send
+    // refuses to send an entry-tier pass rather than fall back to the
+    // 4-variable cover template, so an unset key is a visible skip with a
+    // named reason instead of an invisible non-delivery.
+    ['WALLET_PASS_PDF_TEMPLATE', 'akan_cover_pass_pdf'],
+    ['WALLET_PASS_PDF_TEMPLATE_ENTRY', ''],
+    ['WALLET_PASS_PDF_LANG', 'en'],
     // HMAC secret used by signed-url.ts. Auto-generated on first read if
     // blank — keep empty here so each install gets a unique value.
     ['INTERNAL_TOKEN_SECRET', ''],
@@ -411,6 +445,17 @@ function migrate(db: Database.Database) {
   }
   if (!walletCols.some((c) => c.name === 'event_id')) {
     db.exec('ALTER TABLE wallets ADD COLUMN event_id TEXT');
+  }
+  // pin_enc — AES-256-GCM ciphertext of the plaintext PIN, so an admin can
+  // re-read a PIN the guest lost. pin_hash (bcrypt) remains the ONLY thing
+  // redemption verifies against; this column is read solely by the
+  // admin-only reveal endpoint.
+  //
+  // NULL means "unrecoverable" and is the correct state for: every wallet
+  // issued before this column existed (bcrypt is one-way — they can never be
+  // back-filled), and any wallet issued while WALLET_PIN_ENC_KEY was unset.
+  if (!walletCols.some((c) => c.name === 'pin_enc')) {
+    db.exec('ALTER TABLE wallets ADD COLUMN pin_enc TEXT');
   }
   if (!walletCols.some((c) => c.name === 'reservation_id')) {
     db.exec('ALTER TABLE wallets ADD COLUMN reservation_id TEXT');
@@ -940,6 +985,45 @@ function migrate(db: Database.Database) {
   // category_label: free-text label, validated against a preset list in UI.
   addEvCol('category_slot',  'TEXT');
   addEvCol('category_label', 'TEXT');
+
+  // ─── akan-events-app fields — richer public-site metadata ──────────────
+  // The customer-facing akan-events-app (separate Next.js app that proxies
+  // to this dashboard) expects these fields on every event so its cards can
+  // render with color themes, badges, feature flags, and capacity signals.
+  // Adding them here means one API contract — no per-consumer branching.
+  //
+  //   tagline   — short catchy line under the title on cards.
+  //   hue       — color theme applied to the card ('sunny' / 'tomato' /
+  //               'crimson' / 'ocean' / 'mint' / 'lavender' / 'slate').
+  //               Validated as an enum in the lib layer but stored as free
+  //               text so future palette additions ship without migration.
+  //   featured  — boolean (0/1). Cards flagged featured pin to the top of
+  //               their Day/Night rail on the customer site.
+  //   note      — small badge text ('Headliner', 'Selling fast', 'Local
+  //               favourite') shown next to the title. Optional.
+  //   capacity  — venue capacity limit for THIS event. 0 = unlimited.
+  //               Used by the public route to derive booking_open/sold_out.
+  addEvCol('tagline',   'TEXT');
+  addEvCol('hue',       "TEXT DEFAULT 'sunny'");
+  addEvCol('featured',  'INTEGER DEFAULT 0');
+  addEvCol('note',      'TEXT');
+  addEvCol('capacity',  'INTEGER DEFAULT 0');
+  // is_recurring — flags a repeating event (weekly brunch, monthly quiz).
+  // The customer site shows a "Recurring" chip and can group instances.
+  // Purely presentational today; no scheduling logic is derived from it.
+  addEvCol('is_recurring', 'INTEGER DEFAULT 0');
+
+  // ─── Artist profile metadata (akan-events-app contract) ────────────────
+  // The customer site renders a richer artist card for music events:
+  // "4 members · 2 vocalists · 90 min set". All default 0, which the
+  // projection treats as "not specified" and omits from the payload.
+  const artistCols = db.prepare(`PRAGMA table_info(artists)`).all() as { name: string }[];
+  const addArtistCol = (name: string, ddl: string) => {
+    if (!artistCols.some((c) => c.name === name)) db.exec(`ALTER TABLE artists ADD COLUMN ${name} ${ddl}`);
+  };
+  addArtistCol('vocalists',   'INTEGER DEFAULT 0');
+  addArtistCol('members',     'INTEGER DEFAULT 0');
+  addArtistCol('set_minutes', 'INTEGER DEFAULT 0');
 
   // event_invitees — phone-list mode entries. Phones are stored already
   // normalized via normalizePhone(). Unique-per-event so the same phone

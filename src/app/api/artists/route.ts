@@ -31,6 +31,10 @@ export async function POST(req: NextRequest) {
         about: body.about ? String(body.about) : null,
         social_url: body.social_url ? String(body.social_url) : null,
         image_data: body.image_data ? String(body.image_data) : null,
+        // Counts are clamped in createArtist — the route only allowlists keys.
+        vocalists: body.vocalists == null ? null : Number(body.vocalists),
+        members: body.members == null ? null : Number(body.members),
+        set_minutes: body.set_minutes == null ? null : Number(body.set_minutes),
       },
       session.name,
     );

@@ -34,6 +34,13 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     'invite_message',
     // Per-event Settings — Inquiry contact phone override.
     'inquiry_phone',
+    // Event category (Day/Night classification) — drives the customer
+    // site's section grouping. Enum validation happens in updateEvent().
+    'category_slot', 'category_label',
+    // Public-site card metadata consumed by the customer events app.
+    // hue is enum-validated in updateEvent(); tagline/note are trimmed
+    // and length-capped there too.
+    'tagline', 'hue', 'note',
   ]) {
     if (k in body) patch[k] = body[k];
   }
@@ -66,6 +73,8 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     'base_entry_fee', 'cover_value', 'cutoff_hour',
     'entry_fee_per_person', 'cover_male_stag', 'cover_female_stag', 'cover_couple',
     'gst_percent', 'discount_percent',
+    // Public-site capacity cap. 0 = unlimited; clamped in updateEvent().
+    'capacity',
   ]) {
     if (k in body) patch[k] = Number(body[k]);
   }
@@ -74,6 +83,10 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   if ('is_public' in body) patch.is_public = !!body.is_public;
   if ('entry_enabled' in body) patch.entry_enabled = !!body.entry_enabled;
   if ('cover_enabled' in body) patch.cover_enabled = !!body.cover_enabled;
+  // Public-site "pin to top of its Day/Night rail" flag.
+  if ('featured' in body) patch.featured = !!body.featured;
+  // Public-site "Recurring" chip. Presentational only — no repeat instances.
+  if ('is_recurring' in body) patch.is_recurring = !!body.is_recurring;
 
   // Seating layout — accept the toggle booleans here so the wizard's
   // buildFullPayload can flip the feature on/off in one save. The SVG

@@ -1,0 +1,586 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { getDb } from '@/lib/db';
+import { logAudit } from '@/lib/audit';
+import { getEvent } from '@/lib/events';
+import { getReservation } from '@/lib/reservations';
+import { issueWallet } from '@/lib/wallet';
+import { sendWalletPassPdfWhatsApp } from '@/lib/whatsapp/wallet-pass-pdf-send';
+import { verifyCheckoutSignature, refundPayment } from '@/lib/razorpay';
+import { incrementCouponUse, recordCouponRedemption } from '@/lib/coupons';
+import { reserveZoneSeats } from '@/lib/seating-layout';
+import { trackEvent } from '@/lib/event-analytics';
+import { markRecovered as markCartRecovered } from '@/lib/cart-recovery';
+import { sendBookingAlertWhatsApp, sendSaleWebhook } from '@/lib/notifications';
+import { tryTransitionAfterCapture, type PhaseScope } from '@/lib/ticket-phases';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+interface PaymentRow {
+  id: string;
+  reservation_id: string | null;
+  event_id: string;
+  razorpay_order_id: string;
+  razorpay_payment_id: string | null;
+  amount: number;
+  amount_paise: number;
+  currency: string;
+  status: string;
+  payer_name: string | null;
+  payer_phone: string | null;
+  payer_email: string | null;
+  payment_mode: string | null;
+  txn_id: string | null;
+  verified_at: number | null;
+  coupon_id: string | null;
+  coupon_code: string | null;
+  discount_amount: number | null;
+  notes: string | null;
+  zone_id: string | null;
+}
+
+/**
+ * POST /api/payments/verify — PUBLIC, called by the Razorpay Checkout SDK
+ * on the customer's browser after a successful payment.
+ *
+ * Body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
+ *
+ * Verifies the signature (HMAC-SHA256 of "order_id|payment_id" against
+ * keySecret using timingSafeEqual), marks the payment 'captured', and —
+ * when the event's payment_mode is 'full_cover' — auto-issues a wallet
+ * via issueWallet() and marks the reservation converted.
+ *
+ * Idempotent: if the signature matches a payment that's already captured,
+ * we return the existing wallet's txnId without re-issuing.
+ */
+export async function POST(req: NextRequest) {
+  const body = await req.json().catch(() => ({})) as {
+    razorpayOrderId?: unknown;
+    razorpayPaymentId?: unknown;
+    razorpaySignature?: unknown;
+  };
+
+  const orderId = String(body.razorpayOrderId || '').trim();
+  const paymentId = String(body.razorpayPaymentId || '').trim();
+  const signature = String(body.razorpaySignature || '').trim();
+
+  if (!orderId || !paymentId || !signature) {
+    return NextResponse.json(
+      { ok: false, message: 'razorpayOrderId, razorpayPaymentId, razorpaySignature are required.' },
+      { status: 400 },
+    );
+  }
+
+  if (!verifyCheckoutSignature(orderId, paymentId, signature)) {
+    logAudit({
+      actor: 'public',
+      action: 'payment_verify_signature_fail',
+      entityType: 'payment',
+      details: { razorpay_order_id: orderId, razorpay_payment_id: paymentId },
+    });
+    // Emit a checkout_failed analytics row when we can resolve the
+    // event_id + session_id from the payment.notes (best-effort).
+    try {
+      const db = getDb();
+      const p = db.prepare(`SELECT event_id, notes FROM payments WHERE razorpay_order_id = ?`)
+        .get(orderId) as { event_id: string; notes: string | null } | undefined;
+      if (p?.event_id) {
+        let sid: string | undefined;
+        try { sid = p.notes ? (JSON.parse(p.notes).sessionId as string | undefined) : undefined; } catch { /* ignore */ }
+        trackEvent({
+          eventId: p.event_id,
+          sessionId: sid || 'server__verify',
+          kind: 'checkout_failed',
+          metadata: { source: 'verify_signature_fail', razorpay_order_id: orderId },
+        });
+      }
+    } catch { /* analytics is best-effort */ }
+    return NextResponse.json(
+      { ok: false, message: 'Payment signature could not be verified.' },
+      { status: 400 },
+    );
+  }
+
+  const db = getDb();
+  const payment = db.prepare(`
+    SELECT id, reservation_id, event_id, razorpay_order_id, razorpay_payment_id,
+           amount, amount_paise, currency, status, payer_name, payer_phone,
+           payer_email, payment_mode, txn_id, verified_at,
+           coupon_id, coupon_code, discount_amount, notes,
+           zone_id
+    FROM payments
+    WHERE razorpay_order_id = ?
+    LIMIT 1
+  `).get(orderId) as PaymentRow | undefined;
+
+  if (!payment) {
+    return NextResponse.json(
+      { ok: false, message: 'Payment record not found for this order.' },
+      { status: 404 },
+    );
+  }
+
+  // ── Refuse wallet_topup payments on this endpoint ──
+  // MONEY-RISK GUARD: a stray verify call (replayed by an attacker, stale tab,
+  // or a confused client) against a wallet_topup payment's signature would
+  // otherwise flip status='captured' AND silently no-op the booking branch
+  // (payment_mode is NULL for top-ups) — the customer's money would be
+  // captured but the wallet would NEVER be credited. Top-ups must go through
+  // /api/public/wallet/[token]/topup/verify which credits the wallet inline.
+  let kind: string | undefined;
+  try {
+    kind = payment.notes ? (JSON.parse(payment.notes).kind as string | undefined) : undefined;
+  } catch {
+    /* malformed json — treat as non-topup */
+  }
+  if (kind === 'wallet_topup') {
+    logAudit({
+      actor: 'public',
+      action: 'payment_verify_wrong_endpoint_for_topup',
+      entityType: 'payment',
+      entityId: payment.id,
+      details: { razorpay_order_id: orderId },
+    });
+    return NextResponse.json(
+      { ok: false, message: 'This payment must be verified via the wallet top-up endpoint.' },
+      { status: 400 },
+    );
+  }
+
+  // ── Idempotent capture ──
+  // If we already captured this order, just return the existing wallet (if any).
+  // The browser sometimes re-submits the verify call on page reload — we don't
+  // want to double-issue a wallet.
+  if (payment.status === 'captured' && payment.verified_at) {
+    return NextResponse.json({
+      ok: true,
+      message: 'Payment already verified.',
+      txnId: payment.txn_id || undefined,
+      alreadyCaptured: true,
+    });
+  }
+
+  const event = getEvent(payment.event_id);
+  if (!event) {
+    return NextResponse.json({ ok: false, message: 'Event not found.' }, { status: 404 });
+  }
+
+  const now = Date.now();
+
+  // ── Pre-load the reservation so the capture transaction can reserve
+  //    zone capacity without an extra round-trip. We pull this OUTSIDE
+  //    the transaction body because better-sqlite3 transactions are
+  //    synchronous and we want to fail loudly (clear error message) if
+  //    the reservation has gone away between order and verify.
+  const reservationForCapture = payment.reservation_id
+    ? getReservation(payment.reservation_id)
+    : null;
+
+  // Wrap the capture + coupon increment + zone-seat reservation in a single
+  // transaction so two concurrent verify calls can't push used_count past
+  // max_uses NOR oversell a zone. SQLite is a single-writer engine in WAL
+  // mode, which guarantees serialization of these mutations.
+  // We throw a sentinel error to roll the transaction back; the catch below
+  // converts it into a 409 + would normally trigger a Razorpay refund.
+  let zoneExhausted = false;
+  try {
+    const capture = db.transaction(() => {
+      db.prepare(`
+        UPDATE payments
+        SET status = 'captured',
+            razorpay_payment_id = ?,
+            razorpay_signature = ?,
+            verified_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(paymentId, signature, now, now, payment.id);
+
+      // M/F/C — stamp the gender breakdown onto the reservation row so the
+      // admin reservations table + the per-event Manage page can render
+      // "2M · 1F · 1C" next to the pax count and door staff knows the mix
+      // before the QR scan even fires. The order route already validated
+      // that M + F + 2C === pax, so writing these counts cannot drift from
+      // the reservation's pax. Quietly skip when the payload didn't include
+      // a mix (legacy/older clients) — the columns default to 0.
+      if (payment.reservation_id && payment.notes) {
+        try {
+          const parsed = JSON.parse(payment.notes) as { gender_mix?: { male?: number; female?: number; couple?: number } };
+          const mix = parsed?.gender_mix;
+          if (
+            mix &&
+            (Number.isFinite(mix.male) || Number.isFinite(mix.female) || Number.isFinite(mix.couple))
+          ) {
+            const m = Math.max(0, Math.floor(Number(mix.male) || 0));
+            const f = Math.max(0, Math.floor(Number(mix.female) || 0));
+            const c = Math.max(0, Math.floor(Number(mix.couple) || 0));
+            db.prepare(`
+              UPDATE reservations
+              SET male_count = ?, female_count = ?, couple_count = ?
+              WHERE id = ?
+            `).run(m, f, c, payment.reservation_id);
+          }
+        } catch {
+          // Malformed notes JSON — safe to swallow; the columns just stay 0.
+          // The fee_breakdown read elsewhere uses the same try/catch pattern.
+        }
+      }
+
+      // Reservego prepay — link the reservation to its captured payment so
+      // the Bookings dashboard + admin reservations list show "PAID ✓"
+      // status and so the host can stop sending follow-up reminders. This
+      // happens on EVERY capture (not just prepay-token-sourced ones) —
+      // an /admin/issue door wallet still flips the reservation to
+      // converted via the existing wallet code path, but online capture
+      // wasn't writing the payment FK back. payment_id is nullable so
+      // captures without a reservation (e.g. wallet top-ups) skip cleanly.
+      if (payment.reservation_id) {
+        db.prepare(`
+          UPDATE reservations
+          SET payment_id = ?, status = 'converted'
+          WHERE id = ?
+        `).run(payment.id, payment.reservation_id);
+      }
+
+      // Zone reservation — only applies when the reservation was bound to
+      // a zone at booking time. If the host disabled the seating layout
+      // between order and verify, payment.zone_id stays NULL and this
+      // branch is skipped (the customer's chosen zone is moot).
+      if (
+        reservationForCapture
+        && reservationForCapture.zone_id
+        && (reservationForCapture.zone_pax_count ?? 0) > 0
+      ) {
+        const reserved = reserveZoneSeats(
+          reservationForCapture.zone_id,
+          reservationForCapture.zone_pax_count ?? 0,
+          db,
+        );
+        if (!reserved) {
+          zoneExhausted = true;
+          throw new Error('zone_capacity_exhausted');
+        }
+      }
+
+      if (payment.coupon_id) {
+        // Best-effort: if the coupon is now exhausted (a concurrent verify
+        // raced and won), we still capture the payment — the customer's card
+        // already settled and we can't reverse it from this endpoint. We log
+        // the audit row so the operator can decide whether to refund.
+        const incremented = incrementCouponUse(payment.coupon_id);
+        if (!incremented) {
+          logAudit({
+            actor: 'public',
+            action: 'coupon_overflow_at_verify',
+            entityType: 'payment',
+            entityId: payment.id,
+            details: { coupon_id: payment.coupon_id, coupon_code: payment.coupon_code },
+          });
+        }
+        // Append to the coupon_redemptions ledger so analytics + reversal
+        // tooling can resolve (coupon → payment). INSERT OR IGNORE keeps
+        // this idempotent against verify retries.
+        recordCouponRedemption({
+          couponId: payment.coupon_id,
+          paymentId: payment.id,
+          eventId: payment.event_id,
+          reservationId: payment.reservation_id,
+          discountAmount: payment.discount_amount || 0,
+        });
+      }
+    });
+    capture();
+  } catch (err) {
+    if (zoneExhausted) {
+      // The selected zone sold out between order and verify. The local
+      // transaction rolled back (payment stays 'created', sold_count
+      // untouched). Razorpay has captured the customer's money — we
+      // auto-issue a refund inline so the operator doesn't have to chase
+      // it from the dashboard. Fire-and-forget: the customer's 409 must
+      // not be blocked on Razorpay's refund API latency.
+      logAudit({
+        actor: 'public',
+        action: 'payment_zone_exhausted_at_verify',
+        entityType: 'payment',
+        entityId: payment.id,
+        details: {
+          razorpay_order_id: orderId,
+          razorpay_payment_id: paymentId,
+          reservation_id: payment.reservation_id,
+          zone_id: payment.zone_id,
+        },
+      });
+      // Fire-and-forget refund. We capture the result in a follow-up
+      // audit row so reconciliation can find it; never await so the 409
+      // ships back to the browser immediately.
+      void refundPayment(paymentId, payment.amount_paise)
+        .then((result) => {
+          logAudit({
+            actor: 'public',
+            action: 'payment_refund_zone_exhausted',
+            entityType: 'payment',
+            entityId: payment.id,
+            details: {
+              razorpay_order_id: orderId,
+              razorpay_payment_id: paymentId,
+              amount_paise: payment.amount_paise,
+              refund_ok: result.ok,
+              refund_id: result.refund?.id,
+              refund_status: result.refund?.status,
+              error: result.ok ? undefined : result.error,
+            },
+          });
+        })
+        .catch((err) => {
+          logAudit({
+            actor: 'public',
+            action: 'payment_refund_zone_exhausted',
+            entityType: 'payment',
+            entityId: payment.id,
+            details: {
+              razorpay_order_id: orderId,
+              razorpay_payment_id: paymentId,
+              amount_paise: payment.amount_paise,
+              refund_ok: false,
+              error: err instanceof Error ? err.message : 'unknown',
+            },
+          });
+        });
+      return NextResponse.json(
+        {
+          ok: false,
+          message:
+            'That zone just sold out — refund issued, 5-7 business days. Please contact the venue if you have questions.',
+        },
+        { status: 409 },
+      );
+    }
+    // Any other thrown error inside the transaction is a real bug — let it
+    // surface to the client as a 500 so the operator notices.
+    throw err;
+  }
+
+  logAudit({
+    actor: 'public',
+    action: 'payment_verified',
+    entityType: 'payment',
+    entityId: payment.id,
+    details: {
+      razorpay_order_id: orderId,
+      razorpay_payment_id: paymentId,
+      reservation_id: payment.reservation_id,
+      event_id: payment.event_id,
+      amount: payment.amount,
+      payment_mode: payment.payment_mode,
+    },
+  });
+
+  // ── Phased Ticket Releases — bump sold + auto-transition ─────────────
+  // Fire-and-forget: an exception here must NOT block the verify response.
+  // The customer's card already settled and we want to ack quickly. The
+  // active_phase_id + scope was stamped into payments.notes at /api/payments/
+  // order time, so we can replay the increment even if a later code path
+  // ever moves phase resolution. When notes is missing or malformed
+  // (legacy payments, top-ups), we skip — the absence is the signal.
+  try {
+    const notes = payment.notes ? JSON.parse(payment.notes) as Record<string, unknown> : {};
+    const phaseId = typeof notes.active_phase_id === 'string' ? notes.active_phase_id : '';
+    const phaseScope = typeof notes.active_phase_scope === 'string'
+      ? notes.active_phase_scope as PhaseScope
+      : null;
+    const phaseScopeId = typeof notes.active_phase_scope_id === 'string'
+      ? notes.active_phase_scope_id
+      : null;
+    const phaseCount = Number(notes.active_phase_count);
+    if (phaseId && phaseScope && Number.isFinite(phaseCount) && phaseCount > 0) {
+      tryTransitionAfterCapture({
+        eventId: payment.event_id,
+        scope: phaseScope,
+        scopeId: phaseScopeId,
+        count: phaseCount,
+      });
+    }
+  } catch { /* never block on phase tracking */ }
+
+  // Analytics: emit checkout_success + mark any matching cart-recovery
+  // attempt as recovered. Best-effort — never let an analytics issue block
+  // the payment-confirmation response.
+  try {
+    let sid: string | undefined;
+    try { sid = payment.notes ? (JSON.parse(payment.notes).sessionId as string | undefined) : undefined; } catch { /* ignore */ }
+    trackEvent({
+      eventId: payment.event_id,
+      sessionId: sid || 'server__verify',
+      kind: 'checkout_success',
+      metadata: { paymentId: payment.id, amount: payment.amount },
+    });
+    markCartRecovered(payment.id, payment.reservation_id || null);
+  } catch { /* analytics best-effort */ }
+
+  // ── Settings V2: host booking-alert + sale webhook (fire-and-forget) ──
+  // Both helpers are guarded by config inside the helper, so an unset URL
+  // or a disabled toggle short-circuits cheaply. We deliberately call them
+  // BEFORE the optional issueWallet() await — issuing a wallet can take a
+  // second or two and we don't want the host's alert / external webhook
+  // to be backpressured by it.
+  void sendBookingAlertWhatsApp({
+    guestName: payment.payer_name || 'Guest',
+    eventName: event.name,
+    amount: payment.amount,
+  }).catch(() => { /* never block on host alert */ });
+
+  void sendSaleWebhook({
+    paymentId: payment.id,
+    razorpayPaymentId: paymentId,
+    amount: payment.amount,
+    currency: payment.currency || 'INR',
+    eventId: payment.event_id,
+    eventName: event.name,
+    customerName: payment.payer_name,
+    customerPhone: payment.payer_phone,
+    customerEmail: payment.payer_email,
+    capturedAt: now,
+    reservationId: payment.reservation_id,
+    paymentMode: payment.payment_mode,
+    couponCode: payment.coupon_code,
+  }).catch(() => { /* never block on external webhook */ });
+
+  // ── Auto-issue wallet when full_cover ──
+  // Deposit-mode payments don't issue a wallet yet — the customer pays the
+  // remainder + gets their wallet at the door. Only 'full_cover' guarantees
+  // we've collected entry + cover, so it's the only mode where the wallet
+  // can land automatically.
+  //
+  // ── Affiliate attribution note ──
+  // This route deliberately does NOT call attributeTicket() — payments and
+  // tickets are decoupled here (issueWallet creates wallet/guest rows but
+  // no ticket row). Sales attribution for affiliate / tracking links flows
+  // through POST /api/tickets, which reads the ec_ref cookie (set by
+  // RefCapture from ?ref= OR ?t=) and calls attributeTicket(). For
+  // kind='tracking' affiliates, attributeTicket() stamps tickets.
+  // affiliate_id / affiliate_code (so the per-event Promote page can count
+  // the sale) but skips writing an affiliate_commissions row — tracking
+  // links carry commission_value=0 by construction, so there's nothing to
+  // pay out.
+  let issuedTxnId: string | undefined;
+  let walletMessage = 'Payment confirmed.';
+
+  if (payment.payment_mode === 'full_cover' && payment.reservation_id) {
+    const reservation = getReservation(payment.reservation_id);
+    if (!reservation) {
+      // Edge case: reservation was deleted between order and verify. Payment
+      // is still captured — operator can refund manually.
+      return NextResponse.json({
+        ok: true,
+        message: 'Payment confirmed but reservation lookup failed. Please contact the venue.',
+      });
+    }
+
+    const entryFee = Number(event.entry_fee_per_person) || 0;
+    // amount was charged in INR rupees; cover is whatever's left after the
+    // WHOLE party's entry. Two rules this line has to hold, both money-critical:
+    //
+    //  1. No `|| entryFee` fallback. `Math.max(0, 0)` is 0 and `0 || entryFee`
+    //     silently became entryFee, so a checkout that paid exactly the entry
+    //     total minted a wallet funded with bar credit the venue never sold
+    //     (₹500 per entry-only booking). An entry-only purchase must produce a
+    //     ₹0 redeemable balance. Passing 0 EXPLICITLY also matters: issueWallet
+    //     defaults a NULL/undefined coverIssued to entryFee, so the zero has to
+    //     be a real number, never an omitted field.
+    //  2. entryFee is PER PERSON; totalEntry is what the party actually paid at
+    //     the door. wallets.entry_fee is summed as door revenue by dashboard.ts,
+    //     analytics.ts and cashier.ts, so it must record totalEntry — writing
+    //     the per-person figure under-reported every multi-pax booking by a
+    //     factor of pax (₹1,500 lost on a 4-pax ₹500 booking).
+    const totalEntry = entryFee * Math.max(1, Math.floor(Number(reservation.pax) || 1));
+    const coverIssued = Math.max(0, payment.amount - totalEntry);
+
+    try {
+      const result = await issueWallet({
+        name: payment.payer_name || reservation.name,
+        phone: payment.payer_phone || reservation.phone,
+        email: payment.payer_email || reservation.email || undefined,
+        pax: reservation.pax || 1,
+        // Door money COLLECTED (per-person × pax) — see the totalEntry comment.
+        entryFee: totalEntry,
+        coverIssued,
+        paymentMethod: 'online',
+        issuedBy: 'public-web',
+        eventId: event.id,
+        reservationId: reservation.id,
+      });
+      issuedTxnId = result.txnId;
+      // Say only what is true at the moment we say it. This used to promise
+      // "Your cover pass is on the way." immediately after issueWallet and
+      // return it regardless of the fire-and-forget send below — and that send
+      // silently skips whenever AUTO_SEND_WHATSAPP_PASS is off (it is off in
+      // the live config today), Interakt is unconfigured, the wallet has no
+      // phone, or the entry-only template is missing. The reference always
+      // works at the door, so this sentence is true on every path; the pass, if
+      // it goes out, is a bonus rather than a promise.
+      walletMessage = `Payment confirmed. Reference ${result.txnId} — show this at the door.`;
+
+      db.prepare(`UPDATE payments SET txn_id = ?, updated_at = ? WHERE id = ?`)
+        .run(result.txnId, Date.now(), payment.id);
+
+      // Fire-and-forget WhatsApp send of the PDF pass. We don't await —
+      // sending can take seconds and the customer is waiting on the verify
+      // response.
+      //
+      // result.pin is the plaintext PIN, in memory only here (issueWallet
+      // hashes it before returning and never stores it in the clear). We pass
+      // it unconditionally: the sender uses it only for a cover wallet, where
+      // it is REQUIRED (shipping a 4-variable template with 3 values is
+      // accepted by Interakt and then silently dropped by Meta), and ignores it
+      // for an entry-only wallet, which coverIssued === 0 now legitimately
+      // produces when the customer paid exactly the entry total. The PIN goes
+      // in the message text only — never on the PDF that carries the QR — so a
+      // forwarded screenshot alone can't drain the bar credit.
+      //
+      // ORIGIN IS SERVER-DERIVED, NEVER A REQUEST HEADER. The sender globs this
+      // straight onto a freshly minted, valid wallet_pass token
+      // (`${origin}/api/public/wallet-pass-pdf/${token}`) and hands the result
+      // to Interakt, whose fetcher then GETs it server-side. Reading it from
+      // the caller-supplied `Origin` / `x-forwarded-host` headers — as this did
+      // — let the payer point a live bearer credential at any host they named,
+      // and shipped the guest a WhatsApp document header for a domain the venue
+      // does not control. req.nextUrl.origin is what /api/tickets and
+      // /api/wallets already use for the same call.
+      const origin = req.nextUrl.origin;
+      sendWalletPassPdfWhatsApp({
+        txnId: result.txnId,
+        origin,
+        actor: 'public-web',
+        pin: result.pin,
+      }).catch(() => { /* never block on WhatsApp */ });
+    } catch (err) {
+      // Wallet issue failed even though payment captured — log loudly and
+      // return success so the customer doesn't think their card was charged
+      // for nothing. Operator will see the audit row + payment row with no
+      // txn_id and can reconcile manually.
+      logAudit({
+        actor: 'public',
+        action: 'payment_wallet_issue_failed',
+        entityType: 'payment',
+        entityId: payment.id,
+        details: {
+          error: err instanceof Error ? err.message : 'unknown',
+          razorpay_payment_id: paymentId,
+        },
+      });
+      return NextResponse.json({
+        ok: true,
+        message: 'Payment confirmed. Please contact the venue to claim your cover pass.',
+      });
+    }
+  } else if (payment.payment_mode === 'deposit' && payment.reservation_id) {
+    // Deposit mode — leave the reservation 'pending'. The customer hasn't
+    // committed to the full cover yet; that conversion happens at the door.
+    walletMessage = 'Deposit received. See you at the event!';
+  }
+
+  return NextResponse.json({
+    ok: true,
+    message: walletMessage,
+    txnId: issuedTxnId,
+  });
+}

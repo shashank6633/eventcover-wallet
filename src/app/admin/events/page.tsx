@@ -109,10 +109,17 @@ function EventWizard({ initialEventId, initialSection, onClose }: WizardProps) {
       // before publish (status = 'live').
       category_slot: s.category_slot,
       category_label: s.category_label,
+      // Public-site metadata for the customer akan-events-app.
+      tagline: s.tagline.trim() || null,
+      hue: s.hue,
+      featured: s.featured,
+      note: s.note.trim() || null,
+      capacity: s.capacity,
       one_line_summary: s.one_line_summary || null,
       description: s.description || null,
       event_date: s.event_date,
       start_time: s.start_time || null,
+      is_recurring: s.is_recurring,
       is_public: s.is_public,
       venue_id: s.venue_id || null,
       artist_ids: s.artist_ids,

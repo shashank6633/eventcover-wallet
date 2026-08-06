@@ -86,6 +86,86 @@ export function SectionBasicInfo({ state, onChange }: Props) {
         </div>
       </div>
 
+      {/* Public site metadata — consumed by the customer-facing events app.
+          These don't affect venue operations (covers, wallets, door flow);
+          they control how the event card renders on the public site. */}
+      <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4 space-y-4">
+        <div>
+          <div className="text-sm font-semibold text-slate-900">Public site card</div>
+          <p className="text-[11px] text-slate-500 mt-0.5">
+            How this event appears on your public events site. Doesn&rsquo;t affect door operations.
+          </p>
+        </div>
+
+        {/* Tagline */}
+        <div>
+          <label className="label">Tagline</label>
+          <input
+            className="input"
+            value={state.tagline}
+            onChange={(e) => onChange({ tagline: e.target.value.slice(0, 120) })}
+            placeholder="e.g. Soulful indie covers under the stars"
+            maxLength={120}
+          />
+          <div className="text-[11px] text-slate-400 mt-1">
+            One short line under the title on the card. Max 120 characters.
+          </div>
+        </div>
+
+        {/* Hue swatches */}
+        <div>
+          <label className="label">Card colour</label>
+          <HuePicker value={state.hue} onChange={(hue) => onChange({ hue })} />
+        </div>
+
+        {/* Badge note + capacity side by side */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="label">Badge text</label>
+            <input
+              className="input"
+              value={state.note}
+              onChange={(e) => onChange({ note: e.target.value.slice(0, 40) })}
+              placeholder="e.g. Headliner"
+              maxLength={40}
+            />
+            <div className="text-[11px] text-slate-400 mt-1">
+              Small pill next to the title. Leave blank for none.
+            </div>
+          </div>
+          <div>
+            <label className="label">Capacity</label>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              value={state.capacity || ''}
+              onChange={(e) => onChange({ capacity: Number(e.target.value) || 0 })}
+              placeholder="0 = unlimited"
+            />
+            <div className="text-[11px] text-slate-400 mt-1">
+              Drives &ldquo;Selling fast&rdquo; / &ldquo;Sold out&rdquo; on the public card.
+            </div>
+          </div>
+        </div>
+
+        {/* Featured toggle */}
+        <label className="flex items-start gap-2.5 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={state.featured}
+            onChange={(e) => onChange({ featured: e.target.checked })}
+            className="accent-brand-500 w-4 h-4 mt-0.5"
+          />
+          <span>
+            <span className="text-sm font-medium text-slate-800">Feature this event</span>
+            <span className="block text-[11px] text-slate-500">
+              Pins the card to the top of its Day / Night section on the public site.
+            </span>
+          </span>
+        </label>
+      </div>
+
       {/* URL Key */}
       <div>
         <label className="label">URL Key</label>
@@ -295,6 +375,67 @@ function CategoryPicker({
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * HuePicker — swatch grid for the public-site card colour theme
+ *
+ * The customer-facing events app maps each hue name to a gradient/accent
+ * pair. We render an approximate swatch here so the host can see roughly
+ * what they're picking without leaving the wizard. The swatch colours are
+ * intentionally hardcoded (not pulled from the customer app) — this is a
+ * preview affordance, and coupling the two would mean a shared package
+ * for five hex codes.
+ * ──────────────────────────────────────────────────────────────────────── */
+const HUE_SWATCHES: Array<{ id: string; label: string; css: string }> = [
+  { id: 'sunny',    label: 'Sunny',    css: 'linear-gradient(135deg,#FFD166,#F5A524)' },
+  { id: 'tomato',   label: 'Tomato',   css: 'linear-gradient(135deg,#FF8A65,#E64A19)' },
+  { id: 'crimson',  label: 'Crimson',  css: 'linear-gradient(135deg,#EF5DA8,#C2185B)' },
+  { id: 'ocean',    label: 'Ocean',    css: 'linear-gradient(135deg,#4FC3F7,#0277BD)' },
+  { id: 'mint',     label: 'Mint',     css: 'linear-gradient(135deg,#7BE0AD,#009688)' },
+  { id: 'lavender', label: 'Lavender', css: 'linear-gradient(135deg,#B39DFF,#6A3FD4)' },
+  { id: 'slate',    label: 'Slate',    css: 'linear-gradient(135deg,#94A3B8,#475569)' },
+];
+
+function HuePicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (hue: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {HUE_SWATCHES.map((h) => {
+        const active = value === h.id;
+        return (
+          <button
+            key={h.id}
+            type="button"
+            onClick={() => onChange(h.id)}
+            title={h.label}
+            aria-label={h.label}
+            aria-pressed={active}
+            className={
+              'flex items-center gap-2 rounded-lg border px-2.5 py-1.5 transition ' +
+              (active
+                ? 'border-brand-500 bg-white ring-2 ring-brand-100'
+                : 'border-slate-200 bg-white hover:border-slate-300')
+            }
+          >
+            <span
+              className="w-5 h-5 rounded-md border border-black/10 flex-shrink-0"
+              style={{ background: h.css }}
+              aria-hidden
+            />
+            <span className={`text-xs font-medium ${active ? 'text-brand-800' : 'text-slate-600'}`}>
+              {h.label}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }

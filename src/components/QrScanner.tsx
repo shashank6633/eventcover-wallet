@@ -36,6 +36,15 @@ export function QrScanner({ onDetected, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(true);
   const [lastMiss, setLastMiss] = useState<string | null>(null);
+  /**
+   * Edge of the ACTUAL decode region, published by the qrbox callback below.
+   * The guide reticle is drawn from this rather than a hard-coded 260px: the
+   * decode box became responsive but the overlay did not, so on a short
+   * viewfinder (where the clamp floors at 200px) staff were told to aim inside
+   * a box LARGER than the region that decodes — a code lined up in its corner
+   * silently fails and reads as "the scanner is broken".
+   */
+  const [guideEdge, setGuideEdge] = useState(260);
 
   // Stable callback ref — keeps onDetected fresh without making it a dependency
   // of the start effect (which would cause restart loops on parent re-renders).
@@ -66,41 +75,70 @@ export function QrScanner({ onDetected, onClose }: Props) {
         if (cancelled) return;
 
         const Html5Qrcode = mod.Html5Qrcode;
-        const scanner = new Html5Qrcode(containerId, { verbose: false });
+        // useBarCodeDetectorIfSupported hands decoding to the platform's
+        // native BarcodeDetector (Chrome/Android since 83) instead of the
+        // bundled pure-JS zxing fallback — by far the largest speed win
+        // here. Silently ignored where the API is absent, which then keeps
+        // the JS path.
+        const scanner = new Html5Qrcode(containerId, {
+          verbose: false,
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        });
         scannerRef.current = scanner;
 
-        const cameras = await Html5Qrcode.getCameras();
-        if (!cameras || cameras.length === 0) {
-          setError('No camera detected. Use the manual entry field below.');
-          setStarting(false);
-          return;
-        }
-        const back = cameras.find((c: { label: string }) => /back|rear|environment/i.test(c.label));
-        const cameraId = (back || cameras[0]).id;
+        const scanConfig = {
+          // 10fps left up to 100ms of dead air between decode attempts.
+          fps: 24,
+          // Was a fixed 260x260 box — a small target on a large phone that
+          // staff had to line the code up inside. Sizing off the actual
+          // viewfinder is far more forgiving; clamped to stay sane on very
+          // small and very large viewports.
+          qrbox: (viewW: number, viewH: number) => {
+            const edge = Math.max(200, Math.min(520, Math.floor(Math.min(viewW, viewH) * 0.7)));
+            // Keep the drawn guide equal to the real decode window. Called on
+            // every layout pass, so guard the set to avoid a render loop.
+            setGuideEdge((prev) => (prev === edge ? prev : edge));
+            return { width: edge, height: edge };
+          },
+          aspectRatio: 1,
+        };
 
-        await scanner.start(
-          cameraId,
-          {
-            fps: 10,
-            qrbox: { width: 260, height: 260 },
-            aspectRatio: 1,
-          },
-          (decoded: string) => {
-            // Detection callback. We may still get one stale frame after
-            // safeStop() — the startedRef guard makes that a no-op.
-            if (!startedRef.current) return;
-            const txn = extractTxn(decoded);
-            if (!txn) {
-              setLastMiss(truncate(decoded, 60));
-              return;
-            }
-            setLastMiss(null);
-            // Release the camera cleanly, THEN hand off to the parent.
-            // Either path (stop succeeds or already-stopped) delivers the txn.
-            safeStop().then(() => onDetectedRef.current(txn, decoded));
-          },
-          () => { /* normal "frame without a QR" event — ignore */ },
-        );
+        const onDecoded = (decoded: string) => {
+          // Detection callback. We may still get one stale frame after
+          // safeStop() — the startedRef guard makes that a no-op.
+          if (!startedRef.current) return;
+          const txn = extractTxn(decoded);
+          if (!txn) {
+            setLastMiss(truncate(decoded, 60));
+            return;
+          }
+          setLastMiss(null);
+          // Release the camera cleanly, THEN hand off to the parent.
+          // Either path (stop succeeds or already-stopped) delivers the txn.
+          safeStop().then(() => onDetectedRef.current(txn, decoded));
+        };
+        const onDecodeFailure = () => { /* normal "frame without a QR" event — ignore */ };
+
+        // Fast path: let the browser pick the rear camera from a facingMode
+        // constraint. The old code called getCameras() first, forcing a
+        // device-enumeration round-trip (and on many phones a separate
+        // permission step) before the camera could open.
+        try {
+          await scanner.start({ facingMode: 'environment' }, scanConfig, onDecoded, onDecodeFailure);
+        } catch {
+          // Fallback for devices that reject the constraint — enumerate and
+          // match the rear lens by label, exactly as before.
+          const cameras = await Html5Qrcode.getCameras();
+          if (cancelled) return;
+          if (!cameras || cameras.length === 0) {
+            setError('No camera detected. Use the manual entry field below.');
+            setStarting(false);
+            return;
+          }
+          const back = cameras.find((c: { label: string }) => /back|rear|environment/i.test(c.label));
+          await scanner.start((back || cameras[0]).id, scanConfig, onDecoded, onDecodeFailure);
+        }
+        if (cancelled) return;
         // start() resolved → scanner is actually running now
         startedRef.current = true;
         setStarting(false);
@@ -151,7 +189,10 @@ export function QrScanner({ onDetected, onClose }: Props) {
           )}
           {!starting && !error && (
             <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-              <div className="w-[260px] h-[260px] border-2 border-brand-500/80 rounded-xl shadow-[0_0_0_9999px_rgba(0,0,0,0.45)]"/>
+              <div
+                className="border-2 border-brand-500/80 rounded-xl shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] max-w-full max-h-full"
+                style={{ width: guideEdge, height: guideEdge }}
+              />
             </div>
           )}
         </div>

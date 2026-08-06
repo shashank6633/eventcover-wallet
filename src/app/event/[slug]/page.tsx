@@ -58,7 +58,14 @@ interface PublicEventPayload {
     start_time: string | null;
     genre: string | null;
     venue_id: string;
+    /**
+     * CONTRACT status ('active' | 'archived' | 'sold-out') consumed by the
+     * external customer app. Do NOT branch on this here — use
+     * internal_status, which carries our own 'live' | 'closed' lifecycle.
+     */
     status: string;
+    /** Raw internal lifecycle. 'draft' is already 404'd by the API. */
+    internal_status?: string;
     /** Phase 3: optional, defaults to 'public' for backward compat. */
     access_mode?: AccessMode | null;
     /** Phase 3: optional soft-gate copy shown above the form / on locked screen. */
@@ -266,7 +273,15 @@ export default async function PublicEventPage({
           return ao - bo;
         })
     : [];
-  if (!event || event.status === 'closed') return notFound();
+  // Branch on internal_status — event.status now carries the external
+  // contract enum ('active' | 'archived' | 'sold-out'). Fall back to the
+  // mapped 'archived' so this still 404s if the API response predates the
+  // internal_status field.
+  const closed = event
+    ? (event.internal_status ?? '') === 'closed' ||
+      (!event.internal_status && event.status === 'archived')
+    : false;
+  if (!event || closed) return notFound();
 
   const dateLabel = formatEventDate(event.event_date);
   const imageSrc = normalizeImageSrc(event.image_data);
