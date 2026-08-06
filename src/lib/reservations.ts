@@ -207,11 +207,56 @@ export async function syncReservationsForEvent(eventId: string, providerId: Prov
   return { fetched: rows.length, inserted, existing };
 }
 
+/**
+ * Point a reservation at the wallet it converted into.
+ *
+ * Guarded and audited, unlike the bare UPDATE this used to be. There is no
+ * unique index on wallets.reservation_id, no idempotency key on
+ * POST /api/wallets and no dedupe on (phone, event_id), so a slow response on
+ * venue wifi plus an operator re-tap minted a SECOND funded wallet with a
+ * second live PIN against one booking — and repointed converted_wallet_txn at
+ * it, destroying the link to the first wallet. Its two siblings below
+ * (markReservationNoShow, cancelReservation) both write an audit row; this one
+ * wrote nothing at all, so the pointer moved with no trace on the History page.
+ *
+ * Called from inside issueWallet's transaction: throwing here rolls the wallet
+ * back, which is the only thing that actually prevents the duplicate.
+ *
+ * Two deliberate non-throw cases:
+ *  - Same wallet again → no-op. issueWallet and refundable-entries both call
+ *    this for the same txn (the latter on purpose, defensively), and a webhook
+ *    replay can too; none of those is an error and none should double-audit.
+ *  - Reservation row missing → no-op. A deleted booking is not a
+ *    double-funding risk, and failing here would refuse a wallet at a till
+ *    where the cash has already been taken.
+ */
 export function markReservationConverted(id: string, walletTxn: string) {
   const db = getDb();
+  const existing = db.prepare(
+    `SELECT status, converted_wallet_txn FROM reservations WHERE id = ?`,
+  ).get(id) as { status: ReservationStatus; converted_wallet_txn: string | null } | undefined;
+
+  if (!existing) return;
+  if (existing.converted_wallet_txn === walletTxn) return;
+
+  if (existing.status === 'converted' && existing.converted_wallet_txn) {
+    throw new Error(
+      `Reservation already converted to wallet ${existing.converted_wallet_txn}. ` +
+      `Redeem that wallet instead of issuing a second one.`,
+    );
+  }
+
   db.prepare(
     `UPDATE reservations SET status = 'converted', converted_wallet_txn = ? WHERE id = ?`
   ).run(walletTxn, id);
+
+  logAudit({
+    actor: 'system',
+    action: 'reservation_converted',
+    entityType: 'reservation',
+    entityId: id,
+    details: { wallet_txn: walletTxn, previous_status: existing.status },
+  });
 }
 
 export function markReservationNoShow(id: string) {

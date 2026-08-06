@@ -135,8 +135,25 @@ export function createTicket(input: CreateTicketInput): Ticket {
   if (input.paidOffline && input.complimentary) {
     throw new Error('A ticket cannot be both paid offline and complimentary.');
   }
-  if (input.complimentary && input.price > 0) {
-    throw new Error('Complimentary tickets must have price 0.');
+  // A comp is "the venue gave this away". Guarding `price` alone was not enough:
+  // price is only the LIST total, while entry_amount + cover_amount are what the
+  // wallet is actually funded with downstream (api/tickets/route.ts computes
+  // hasSplit from them and passes cover_amount straight into issueWallet as
+  // spendable balance). So {price: 0, complimentary: true, coverAmount: 5000}
+  // used to book as a ₹0 comp in every revenue report and in affiliate
+  // attribution — both key off ticket.price — while minting ₹5,000 of
+  // redeemable bar credit. The admin UI can't produce that (it derives
+  // price = entry + cover client-side, so the price guard already caught it);
+  // the hole was API-only, reachable by the lowest 'entry' role, and that is
+  // exactly the surface the akan-events-app proxy posts to.
+  //
+  // INVARIANT: complimentary ⇒ price === 0 AND entry_amount === 0 AND
+  // cover_amount === 0. A funded giveaway must not ride in on a ₹0 comp — it
+  // needs its own explicitly-gated field and audit action.
+  const compEntry = Number(input.entryAmount ?? 0);
+  const compCover = Number(input.coverAmount ?? 0);
+  if (input.complimentary && (input.price > 0 || compEntry > 0 || compCover > 0)) {
+    throw new Error('Complimentary tickets must have price, entry and cover all 0.');
   }
 
   const db = getDb();

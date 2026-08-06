@@ -18,6 +18,32 @@
  * the index so it can be re-billed after correction. We ALSO do a defensive
  * SELECT inside the tx to fail-fast with a friendly error rather than
  * surfacing a raw SQLITE_CONSTRAINT.
+ *
+ * ─── THIS IS THE VENUE'S SECOND REDEMPTION LEDGER. READ THIS BEFORE ADDING
+ *     ANY REPORT THAT COUNTS MONEY. ───────────────────────────────────────
+ *
+ * Wallet redemptions write `redemptions` (redemption.ts). Reservation cover
+ * redemptions write `cover_redemptions` — this table. They are not the same
+ * ledger and nothing reconciles them.
+ *
+ * Current reader status:
+ *   • transactions.ts (History register) — READS THIS TABLE. Rows appear as
+ *     kind='reservation_redemption' in their own totals bucket, deliberately
+ *     NOT summed into redemptions_amount.
+ *   • cashier.ts (shift settlement), analytics.ts, analytics-dashboard.ts,
+ *     dashboard.ts — STILL BLIND. Money debited here is visible on History
+ *     but is never settled against the till and never reaches revenue.
+ *
+ * Do NOT "fix" that by having redeemCover() also INSERT a `redemptions` row:
+ * `redemptions.txn_id` is `TEXT NOT NULL REFERENCES wallets(txn_id)` and a
+ * reservation has no wallet (converted_wallet_txn is nullable and normally
+ * null), so that row cannot legally exist. Unifying means either giving
+ * bookings real wallets, or teaching the remaining readers to union this
+ * table — a product decision, not a patch.
+ *
+ * Blast radius today is zero and structurally so: every live reservation has
+ * cover_amount = 0, so `cleanAmount > balance` rejects every debit. The path
+ * is live but inert until something starts populating reservations.cover_amount.
  */
 
 import { nanoid } from 'nanoid';

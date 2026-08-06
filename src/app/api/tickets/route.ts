@@ -12,14 +12,15 @@ import { requireRole } from '@/lib/auth';
 import { getEvent } from '@/lib/events';
 import { issueWallet } from '@/lib/wallet';
 import { getConfig } from '@/lib/db';
-import { sendWalletPassWhatsApp } from '@/lib/whatsapp/wallet-pass-send';
+import { sendWalletPassPdfWhatsApp } from '@/lib/whatsapp/wallet-pass-pdf-send';
 import { logAudit } from '@/lib/audit';
 import {
   getEffectivePixelId,
   getCapiAccessToken,
+  getTestEventCode,
   hashSha256Lowercase,
   normalizePhoneForCapi,
-  sendCapiEvent,
+  sendCapiEventAudited,
 } from '@/lib/meta-pixel';
 
 export const runtime = 'nodejs';
@@ -45,14 +46,51 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({}));
   // Optional M/F/C breakdown — the offline form now ships these alongside
-  // pax + price. We trust the caller's pax/price totals (no server-side
-  // recompute) but normalize the counts so the ticket row carries clean
-  // non-negative ints. Missing keys default to 0.
+  // pax + price. We still trust the caller's pax total (no rate-card recompute
+  // here) but normalize the counts so the ticket row carries clean
+  // non-negative ints. Missing keys default to 0. The money fields are NOT
+  // taken on trust — see the reconciliation block below.
   const mix = (body.genderMix ?? {}) as { male?: unknown; female?: unknown; couple?: unknown };
   const nn = (v: unknown) => {
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
   };
+
+  // ─── Money reconciliation: price MUST equal entry + cover ─────────────────
+  // price, entryAmount and coverAmount arrive as three INDEPENDENT body fields
+  // and land in three independent columns, but they are not independent
+  // quantities: tickets.price is what the revenue roll-up and the affiliate
+  // saleAmount below are computed from, while cover_amount becomes the guest's
+  // spendable wallet balance a few lines further down. Nothing downstream ever
+  // compares them, so a caller that sends {price: 100, entryAmount: 1000,
+  // coverAmount: 1000} books ₹100 of revenue against ₹1,000 of bar liability
+  // and every report still balances. The admin form derives price from the
+  // split (/admin/tickets:241 `priceN = entryN + coverN`) so it can never trip
+  // this — but "the client does it right" is not an invariant, and this route
+  // is reachable by the akan-events-app proxy and any stale mobile build.
+  //
+  // Tolerance is half a paisa: the form sends price as the literal sum of the
+  // same two doubles, so an honest client is exact and only a real mismatch
+  // (or float noise from a hand-built payload) can exceed it.
+  const priceN = Number(body.price ?? 0);
+  const entryN = Number(body.entryAmount ?? 0);
+  const coverN = Number(body.coverAmount ?? 0);
+  if (!Number.isFinite(entryN) || entryN < 0) {
+    return NextResponse.json({ ok: false, message: 'Entry amount must be a number ≥ 0.' }, { status: 400 });
+  }
+  if (!Number.isFinite(coverN) || coverN < 0) {
+    return NextResponse.json({ ok: false, message: 'Cover amount must be a number ≥ 0.' }, { status: 400 });
+  }
+  // split === 0 is the legacy single-price contract (no split columns sent):
+  // the whole price is treated as cover downstream. Left working as-is.
+  const split = entryN + coverN;
+  if (split > 0 && Math.abs(split - priceN) > 0.005) {
+    return NextResponse.json({
+      ok: false,
+      message: `Entry ₹${entryN} + cover ₹${coverN} must equal price ₹${priceN}.`,
+    }, { status: 400 });
+  }
+
   try {
     const ticket = createTicket({
       eventId: String(body.eventId || ''),
@@ -65,7 +103,7 @@ export async function POST(req: NextRequest) {
       pax: Number(body.pax ?? 1),
       ticketNotes: body.ticketNotes ?? null,
       internalNotes: body.internalNotes ?? null,
-      price: Number(body.price ?? 0),
+      price: priceN,
       paidOffline: !!body.paidOffline,
       complimentary: !!body.complimentary,
       createdBy: session.name,
@@ -74,9 +112,10 @@ export async function POST(req: NextRequest) {
       coupleCount: nn(mix.couple),
       // Optional entry/cover split. When omitted, columns default to 0 +
       // the wallet treats the whole price as cover (legacy single-price
-      // semantics). When supplied, sum should equal price (client enforced).
-      entryAmount: Number(body.entryAmount ?? 0),
-      coverAmount: Number(body.coverAmount ?? 0),
+      // semantics). When supplied, entry + cover === price is enforced by
+      // the reconciliation block above — server-side, not client-side.
+      entryAmount: entryN,
+      coverAmount: coverN,
     });
 
     // ─── Affiliate attribution (best-effort) ──────────────────────────────
@@ -180,12 +219,18 @@ export async function POST(req: NextRequest) {
         whatsappQueued = true;
         const origin = req.nextUrl.origin;
         // Fire-and-forget: never block the API response on Interakt latency.
-        // Errors are logged via the audit row inside sendWalletPassWhatsApp.
-        sendWalletPassWhatsApp({
+        // Errors are logged via the audit row inside sendWalletPassPdfWhatsApp.
+        //
+        // result.pin is the plaintext PIN — available only here, before
+        // hashing. The sender puts it in the message TEXT for a cover wallet
+        // (this block's ticketCover > 0 case) and ignores it for an entry-only
+        // pass, which has no balance to redeem. It never reaches the PDF that
+        // carries the QR, so a stolen screenshot can't drain bar credit.
+        sendWalletPassPdfWhatsApp({
           txnId: result.txnId,
           origin,
-          qrCodeId: result.pin.slice(-4),
           actor: session.name,
+          pin: result.pin,
         }).catch(() => { /* never block ticket create */ });
       }
 
@@ -221,14 +266,21 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // ─── Meta CAPI Purchase (fire-and-forget) ─────────────────────────────
-    // Only fires when the customer's browser came in with FB cookies AND
-    // CAPI is fully configured. The browser Pixel snippet may also be
-    // sending its own Purchase — we pass ticket.id as event_id so Meta
-    // can dedupe the pair.
-    const fbp = req.cookies.get('_fbp')?.value;
-    const fbc = req.cookies.get('_fbc')?.value;
-    if ((fbp || fbc) && !ticket.complimentary && ticket.price > 0) {
+    // ─── Meta CAPI Purchase ───────────────────────────────────────────────
+    // Deliberately NOT gated on the _fbp/_fbc cookies any more. That gate was
+    // backwards: the Conversions API exists to report conversions the browser
+    // Pixel CANNOT — ad blockers, Safari ITP, and this very endpoint, which is
+    // the staff-facing door-issuing screen where a staff browser has no
+    // Facebook cookies at all. Requiring a cookie meant the sales least likely
+    // to be tracked client-side were also skipped server-side, so they were
+    // lost twice. The cookies are still forwarded when present because they
+    // sharpen attribution; their absence just costs match quality, not the
+    // event.
+    //
+    // Still correctly skipped: comps and ₹0 tickets. Those are not purchases,
+    // and reporting them as Purchase with value 0 would drag down the ROAS
+    // Meta optimises against.
+    if (!ticket.complimentary && ticket.price > 0) {
       const accessToken = getCapiAccessToken();
       if (accessToken) {
         const event = getEvent(ticket.event_id);
@@ -237,29 +289,44 @@ export async function POST(req: NextRequest) {
           const fwd = req.headers.get('x-forwarded-for') || '';
           const clientIp = fwd.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined;
           const userAgent = req.headers.get('user-agent') || undefined;
-          const phoneHash = hashSha256Lowercase(normalizePhoneForCapi(ticket.customer_phone));
+          const digits = normalizePhoneForCapi(ticket.customer_phone || '');
 
-          sendCapiEvent({
-            pixelId,
-            accessToken,
-            eventName: 'Purchase',
-            eventId: ticket.id,  // matches browser-side event_id for dedup
-            actionSource: 'website',
-            userData: {
-              ph: [phoneHash],
-              fbp: fbp || undefined,
-              fbc: fbc || undefined,
-              client_ip_address: clientIp,
-              client_user_agent: userAgent,
+          sendCapiEventAudited(
+            {
+              pixelId,
+              accessToken,
+              eventName: 'Purchase',
+              eventId: ticket.id,  // matches browser-side eventID for dedup
+              actionSource: 'website',
+              testEventCode: getTestEventCode() || undefined,
+              userData: {
+                // Hashing '' produces a valid SHA-256 that matches no human and
+                // makes Meta score the payload as low quality — send nothing
+                // rather than a guaranteed non-match.
+                ph: digits ? [hashSha256Lowercase(digits)] : undefined,
+                fbp: req.cookies.get('_fbp')?.value || undefined,
+                fbc: req.cookies.get('_fbc')?.value || undefined,
+                client_ip_address: clientIp,
+                client_user_agent: userAgent,
+              },
+              customData: {
+                value: ticket.price,
+                currency: 'INR',
+                content_name: event?.name || ticket.ticket_name,
+                content_ids: [ticket.id],
+                num_items: ticket.pax,
+              },
             },
-            customData: {
+            {
+              actor: session.name,
+              entityType: 'ticket',
+              entityId: ticket.id,
+              eventName: 'Purchase',
+              eventId: ticket.id,
+              pixelId,
               value: ticket.price,
-              currency: 'INR',
-              content_name: event?.name || ticket.ticket_name,
-              content_ids: [ticket.id],
-              num_items: ticket.pax,
             },
-          }).catch(() => { /* never block ticket response on Meta */ });
+          );
         }
       }
     }

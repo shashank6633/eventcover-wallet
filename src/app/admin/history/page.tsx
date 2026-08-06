@@ -48,17 +48,37 @@ interface Me { id: string; name: string; role: 'host' | 'manager' | 'cashier' | 
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
+/**
+ * The venue's day is an IST day, and IST has no DST — so a fixed +05:30 is
+ * exact, and both helpers below are anchored to it rather than to whatever
+ * timezone the machine viewing this page happens to be in.
+ *
+ * This page renders every timestamp with timeZone: 'Asia/Kolkata' (fmtDateTime)
+ * but used to build its from/to bounds with `new Date(y, m-1, d, …)`, i.e.
+ * midnight in the BROWSER's zone. On any non-IST machine that silently slid the
+ * whole reporting window by the UTC offset: from a New York laptop, "8 Aug" ran
+ * 09:30 IST on the 8th to 09:29 IST on the 9th, so a 01:30 redemption on the
+ * 8th vanished from the report while a 01:30 redemption on the 9th appeared in
+ * it. Money moved between report days depending on where the laptop was.
+ */
+const IST_OFFSET_MS = 5.5 * 3600 * 1000;
+
 function toLocalDateInput(ms: number): string {
-  const d = new Date(ms);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
+  // "Today" in IST, so the default range agrees with the window it produces.
+  const ist = new Date(ms + IST_OFFSET_MS);
+  const y = ist.getUTCFullYear();
+  const m = String(ist.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(ist.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 }
 function fromDateInput(s: string, endOfDay = false): number {
   if (!s) return 0;
   const [y, m, d] = s.split('-').map(Number);
-  return new Date(y, (m || 1) - 1, d || 1, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0).getTime();
+  const asUtc = Date.UTC(
+    y, (m || 1) - 1, d || 1,
+    endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0,
+  );
+  return asUtc - IST_OFFSET_MS;
 }
 function fmtINR(n: number): string {
   return `₹${(n ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
@@ -85,6 +105,9 @@ function statusIsCritical(s: TxnStatus): boolean {
   return s === 'Voided' || s === 'Reversed';
 }
 
+/** How long a revealed PIN stays on screen before it hides itself. */
+const PIN_REVEAL_MS = 30_000;
+
 // ─── page ──────────────────────────────────────────────────────────────────
 
 export default function HistoryPage() {
@@ -103,6 +126,10 @@ export default function HistoryPage() {
   const [me, setMe]             = useState<Me | null>(null);
   const [busyId, setBusyId]     = useState<string | null>(null);
   const [toast, setToast]       = useState<string | null>(null);
+  // Only ever ONE revealed PIN on screen — a list of exposed PINs is a
+  // shoulder-surfing target, and the admin only ever needs the wallet in front
+  // of them. Cleared automatically after PIN_REVEAL_MS.
+  const [revealed, setRevealed] = useState<{ txnId: string; pin: string } | null>(null);
 
   // session — to gate the Action column
   useEffect(() => {
@@ -113,6 +140,14 @@ export default function HistoryPage() {
     const t = setTimeout(() => setQDebounced(q.trim()), 250);
     return () => clearTimeout(t);
   }, [q]);
+
+  // Auto-hide the revealed PIN. The admin reads it out or copies it within
+  // seconds; leaving it on an unattended browser tab is how a PIN leaks.
+  useEffect(() => {
+    if (!revealed) return;
+    const t = setTimeout(() => setRevealed(null), PIN_REVEAL_MS);
+    return () => clearTimeout(t);
+  }, [revealed]);
 
   const fetchData = useMemo(() => () => {
     const params = new URLSearchParams();
@@ -183,11 +218,59 @@ export default function HistoryPage() {
     } finally { setBusyId(null); setTimeout(() => setToast(null), 3500); }
   }
 
+  /**
+   * Re-read a guest's PIN. POST (never a link) because the server logs every
+   * call as `wallet_pin_revealed`, and a GET would fire on prefetch.
+   *
+   * The 409 messages tell the operator whether the key is missing, mismatched,
+   * or the wallet simply predates PIN recovery — so they're surfaced verbatim
+   * rather than flattened into "could not reveal".
+   */
+  async function revealPin(txnId: string) {
+    setBusyId(txnId);
+    try {
+      const res = await fetch(`/api/wallets/${encodeURIComponent(txnId)}/reveal-pin`, {
+        method: 'POST',
+      });
+      const d = await res.json();
+      if (!d.ok) {
+        setRevealed(null);
+        setToast(d.message || 'Could not reveal the PIN.');
+        return;
+      }
+      setRevealed({ txnId, pin: String(d.pin) });
+    } catch {
+      setToast('Could not reach the server.');
+    } finally {
+      setBusyId(null);
+      // Reveal errors are wordier than the void/settle ones — give them longer
+      // on screen than the usual 3.5s toast.
+      setTimeout(() => setToast(null), 8000);
+    }
+  }
+
+  async function copyPin(pin: string) {
+    try {
+      // Absent on http:// origins — fall back to telling the admin to read it
+      // off the screen rather than silently doing nothing.
+      await navigator.clipboard.writeText(pin);
+      setToast('PIN copied');
+    } catch {
+      setToast('Copy unavailable here — read the PIN off the screen.');
+    }
+    setTimeout(() => setToast(null), 2500);
+  }
+
   // Destructive transaction actions (Void wallet, Unsettle redemption) are
   // strictly admin-only — manager, cashier and other roles cannot reverse real
   // money. Settling itself is operational and stays open to manager + cashier.
   const canMutate = me?.role === 'host';
   const canSettle = me?.role === 'host' || me?.role === 'manager' || me?.role === 'cashier';
+  // Separate from canMutate even though both resolve to 'host' today: the PIN
+  // gate exists to keep the PIN away from the floor staff who hold the
+  // scanner, not because revealing it moves money. The server enforces this
+  // independently — hiding the control is only so staff aren't tempted to ask.
+  const canRevealPin = me?.role === 'host';
 
   function exportCsv() {
     const params = new URLSearchParams();
@@ -232,6 +315,18 @@ export default function HistoryPage() {
       <p className="text-sm text-slate-500 mt-1 max-w-3xl">
         Every entry and cover-charge transaction — issuances, redemptions, settlements
         and alterations (voids, refunds, reversals).
+      </p>
+      {/*
+        State the day boundary on screen. This page filters on calendar days
+        (midnight→midnight IST) while a party night runs past midnight and the
+        Analytics ledger groups by a 05:00 IST shift — so the same Saturday
+        night can total differently on the two screens. Until one shared
+        business-day range exists server-side, the honest fix is to say which
+        boundary this screen uses rather than let a manager assume.
+      */}
+      <p className="text-xs text-slate-400 mt-1 max-w-3xl">
+        Days run midnight to midnight IST. Cover redeemed after midnight on an event
+        night is counted on the following day.
       </p>
 
       {/* KPI strip */}
@@ -372,10 +467,14 @@ export default function HistoryPage() {
                           busy={busyId === r.wallet_txn_id || busyId === r.id.replace(/^redeem:/, '')}
                           canMutate={!!canMutate}
                           canSettle={!!canSettle}
+                          canRevealPin={!!canRevealPin}
+                          revealedPin={revealed?.txnId === r.wallet_txn_id ? revealed.pin : null}
                           onVoid={() => voidWallet(r.wallet_txn_id)}
                           onSettle={() => settle(r.id.replace(/^redeem:/, ''))}
                           onUnsettle={() => unsettle(r.id.replace(/^redeem:/, ''))}
                           onPivot={() => setQ(r.wallet_txn_id)}
+                          onRevealPin={() => revealPin(r.wallet_txn_id)}
+                          onCopyPin={(pin) => copyPin(pin)}
                         />
                       </td>
                     </tr>
@@ -419,10 +518,14 @@ export default function HistoryPage() {
                   busy={busyId === r.wallet_txn_id || busyId === r.id.replace(/^redeem:/, '')}
                   canMutate={!!canMutate}
                   canSettle={!!canSettle}
+                  canRevealPin={!!canRevealPin}
+                  revealedPin={revealed?.txnId === r.wallet_txn_id ? revealed.pin : null}
                   onVoid={() => voidWallet(r.wallet_txn_id)}
                   onSettle={() => settle(r.id.replace(/^redeem:/, ''))}
                   onUnsettle={() => unsettle(r.id.replace(/^redeem:/, ''))}
                   onPivot={() => setQ(r.wallet_txn_id)}
+                  onRevealPin={() => revealPin(r.wallet_txn_id)}
+                  onCopyPin={(pin) => copyPin(pin)}
                 />
               </div>
             </li>
@@ -452,17 +555,28 @@ function Kpi({ label, value, sub, tone }: { label: string; value: string; sub?: 
 }
 
 function ActionButtons({
-  row, busy, canMutate, canSettle, onVoid, onSettle, onUnsettle, onPivot,
+  row, busy, canMutate, canSettle, canRevealPin, revealedPin,
+  onVoid, onSettle, onUnsettle, onPivot, onRevealPin, onCopyPin,
 }: {
   row: TransactionRow;
   busy: boolean;
   canMutate: boolean;
   canSettle: boolean;
+  canRevealPin: boolean;
+  /** The plaintext PIN when this row is the one currently revealed, else null. */
+  revealedPin: string | null;
   onVoid: () => void;
   onSettle: () => void;
   onUnsettle: () => void;
   onPivot: () => void;
+  onRevealPin: () => void;
+  onCopyPin: (pin: string) => void;
 }) {
+  // A PIN only guards a cover balance — an entry-only ticket (cover 0) has
+  // nothing to redeem, so offering to reveal its PIN is noise. Redemption rows
+  // aren't wallets at all.
+  const pinApplies = row.kind === 'entry' && (row.cover_issued ?? 0) > 0;
+
   return (
     <div className="inline-flex items-center gap-1 flex-wrap justify-end">
       <button
@@ -473,6 +587,31 @@ function ActionButtons({
       >
         View
       </button>
+      {pinApplies && canRevealPin && (
+        revealedPin ? (
+          <span className="inline-flex items-center gap-1 rounded border border-amber-200 bg-amber-50 pl-2 pr-1 py-0.5">
+            <span className="font-mono text-xs tracking-widest text-amber-900">{revealedPin}</span>
+            <button
+              type="button"
+              onClick={() => onCopyPin(revealedPin)}
+              className="text-[11px] text-amber-700 hover:text-amber-900 font-medium px-1.5 py-0.5 rounded hover:bg-amber-100"
+              title="Copy PIN — hides itself after 30 seconds"
+            >
+              Copy
+            </button>
+          </span>
+        ) : (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onRevealPin}
+            className="text-[11px] text-slate-500 hover:text-amber-700 px-2 py-1 rounded hover:bg-amber-50 disabled:opacity-50"
+            title="Reveal this guest's PIN — admin only, and every reveal is logged"
+          >
+            {busy ? '…' : 'PIN'}
+          </button>
+        )
+      )}
       {row.kind === 'entry' && row.status === 'Active' && canMutate && (
         <button
           type="button"

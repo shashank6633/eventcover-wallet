@@ -1,21 +1,39 @@
 /**
  * Transaction register — the source of truth for the History page.
  *
- * Unions two streams into one ledger so an operator can see every entry &
+ * Unions four streams into one ledger so an operator can see every entry &
  * cover-charge movement in date order:
  *
  *   1. Wallet issuances  — money IN at the door  (Transaction = "Entry & Cover")
  *   2. Redemptions       — cover spent at bar    (Transaction = "Cover Redemption")
+ *   3. Voids / refunds   — money OUT             (Transaction = "Cover Void / Refund")
+ *   4. Reservation cover — the second, separate redemption ledger
+ *                                                (Transaction = "Reservation Cover Redeem")
  *
- * Each row carries the current status (Active / Voided / Expired / Exhausted /
- * Pending / Settled / Reversed) so an "alteration" — voiding a cover, reversing
- * a redemption, auto-expiry — surfaces immediately without needing a separate
- * row. The audit_log still records the *who/when* of every state change
- * (queryable via /api/history when needed for forensic detail).
+ * Why 3 is its own stream and not just a status on the issuance row:
+ * a void is a money movement that happens on its OWN date. Decorating the
+ * issuance row means a wallet issued Monday and refunded Wednesday appears
+ * nowhere at all in Wednesday's view, and looks like a plain 'Exhausted'
+ * (i.e. a guest who drank it all) in Monday's. A refund could be issued and
+ * reconciled away without ever surfacing. The issuance row still carries the
+ * 'Voided' status so the wallet's CURRENT state is visible from any window —
+ * that lookup is now keyed on the wallets in the result set rather than on the
+ * report window, because the wallet is voided regardless of when you look.
+ *
+ * Why 4 exists: reservation cover redemptions live in `cover_redemptions`
+ * (see cover-redemption.ts), a completely separate table from `redemptions`.
+ * Every report in this codebase reads only `redemptions`, so money debited on
+ * the reservation path was invisible to the register. It is surfaced here as
+ * its own kind, with its own totals bucket — deliberately NOT merged into
+ * redemptions_amount, because the two ledgers are not yet reconciled and
+ * silently adding them would double-count the day someone bridges a
+ * reservation to a wallet. NOTE: cashier.ts (shift settlement) and
+ * analytics.ts still read `redemptions` only — this makes the money visible,
+ * it does not make it settleable.
  */
 import { getDb } from './db';
 
-export type TxnKind = 'entry' | 'redemption';
+export type TxnKind = 'entry' | 'redemption' | 'void' | 'reservation_redemption';
 
 export type TxnStatus =
   | 'Active'      // wallet still has balance
@@ -52,6 +70,8 @@ export interface TransactionRow {
   payment_method?: string;
   balance?: number;
   cover_issued?: number;
+  /** Door charge on an entry row. `amount` is entry_fee + cover_issued. */
+  entry_fee?: number;
   expires_at?: number | null;
   /** Settlement metadata (only for redemption rows). */
   settled_by?: string | null;
@@ -80,30 +100,51 @@ export interface TransactionListResult {
   /** Roll-ups for the page header strip. */
   totals: {
     entries_count: number;
+    /** Money COLLECTED at the door: entry_fee + cover_issued. */
     entries_amount: number;
     redemptions_count: number;
     redemptions_amount: number;
     settled_amount: number;
     pending_amount: number;
+    /** Voids/refunds that HAPPENED in this range (not "wallets that are voided"). */
     voided_count: number;
+    /** ₹ refunded by those voids. */
+    voided_amount: number;
     reversed_count: number;
+    /** Reservation-cover ledger — kept separate; see the file header. */
+    reservation_redemptions_count: number;
+    reservation_redemptions_amount: number;
   };
 }
 
 /**
- * Make sure every redemption in the period has an invoice_no stamped on it.
+ * Make sure every redemption has an invoice_no stamped on it.
  * Identical pattern to cashier.ts — the FB prefix + rowid gives a stable,
  * monotonic invoice number that won't shift if rows are added.
+ *
+ * Two deliberate properties:
+ *
+ *  • NOT window-scoped. The value is a pure function of rowid, so stamping is
+ *    order-independent either way — but scoping it to the report window meant
+ *    the same redemption showed FB{rowid} on the cashier screen and the
+ *    `FB{id-suffix}` fallback on History until somebody happened to open the
+ *    right date range. One unscoped pass converges immediately.
+ *
+ *  • Guarded by a cheap existence probe so this read path only writes when
+ *    there is genuinely something to stamp. Once converged, /api/transactions
+ *    is a pure read. (The correct home for this is redeemWallet()'s INSERT,
+ *    in redemption.ts — until it moves there, this keeps History and the
+ *    cashier agreeing on one invoice number.)
  */
-function backfillInvoiceNumbers(from: number, to: number) {
+function backfillInvoiceNumbers() {
   const db = getDb();
-  db.exec(`
-    UPDATE redemptions
-    SET invoice_no = 'FB' || rowid
-    WHERE invoice_no IS NULL
-      AND created_at >= ${from}
-      AND created_at < ${to}
-  `);
+  const pending = db.prepare(
+    `SELECT 1 FROM redemptions WHERE invoice_no IS NULL LIMIT 1`,
+  ).get();
+  if (!pending) return;
+  db.prepare(
+    `UPDATE redemptions SET invoice_no = 'FB' || rowid WHERE invoice_no IS NULL`,
+  ).run();
 }
 
 function mapWalletStatus(s: string): TxnStatus {
@@ -121,21 +162,42 @@ function mapWalletStatus(s: string): TxnStatus {
 
 /**
  * Inspect audit_log to flip the wallet status to 'Voided' when a wallet_void
- * event exists for the txn_id. Done as a separate pass so the main UNION
- * stays a single, fast SQL query.
+ * event exists for the txn_id.
+ *
+ * Keyed on the WALLETS IN THE RESULT SET, not on the report window. A wallet
+ * voided last week is still voided when you look at the day it was issued; the
+ * old window-bounded lookup required the issue AND the void to fall inside the
+ * same filter, so a cross-day void rendered as a plain 'Exhausted' — visually
+ * identical to a guest who drank the whole balance.
  */
-function loadVoidedTxnIds(from: number, to: number): Set<string> {
+function loadVoidedTxnIds(txnIds: string[]): Set<string> {
+  if (txnIds.length === 0) return new Set();
   const db = getDb();
+  const placeholders = txnIds.map(() => '?').join(',');
   const rows = db.prepare(`
     SELECT DISTINCT entity_id
     FROM audit_log
     WHERE action = 'wallet_void'
       AND entity_type = 'wallet'
-      AND timestamp >= ?
-      AND timestamp <= ?
-      AND entity_id IS NOT NULL
-  `).all(from, to) as { entity_id: string }[];
+      AND entity_id IN (${placeholders})
+  `).all(...txnIds) as { entity_id: string }[];
   return new Set(rows.map((r) => r.entity_id));
+}
+
+/** Audit `details` is TEXT holding JSON; a malformed row must not kill the register. */
+function parseDetails(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function num(v: unknown): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 function mapRedemptionStatus(status: string, settled: number | null): TxnStatus {
@@ -144,12 +206,16 @@ function mapRedemptionStatus(status: string, settled: number | null): TxnStatus 
 }
 
 export function listTransactions(filters: TransactionFilters): TransactionListResult {
-  backfillInvoiceNumbers(filters.from, filters.to);
+  backfillInvoiceNumbers();
   const db = getDb();
   const limit = Math.min(5000, Math.max(50, filters.limit ?? 1000));
+  // A void is an alteration of an entry, so it rides with the "Entries" tab
+  // rather than with "Redeems".
+  const wantEntrySide = filters.kind !== 'redemption';
+  const wantRedeemSide = filters.kind !== 'entry';
 
   // ─── Entries (wallet issuances) ────────────────────────────────────────
-  const entryRows = filters.kind === 'redemption'
+  const entryRows = !wantEntrySide
     ? []
     : db.prepare(`
         SELECT
@@ -169,7 +235,7 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
       }>;
 
   // ─── Redemptions (cover spent at bar) ──────────────────────────────────
-  const redemptionRows = filters.kind === 'entry'
+  const redemptionRows = !wantRedeemSide
     ? []
     : db.prepare(`
         SELECT
@@ -191,7 +257,49 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
         customer_name: string | null; customer_phone: string | null;
       }>;
 
-  const voided = loadVoidedTxnIds(filters.from, filters.to);
+  // ─── Voids / refunds (money OUT, on the date it actually happened) ─────
+  const voidEventRows = !wantEntrySide
+    ? []
+    : db.prepare(`
+        SELECT
+          a.id, a.timestamp, a.actor, a.entity_id, a.details,
+          w.cover_issued, w.entry_fee, w.expires_at,
+          g.name AS customer_name, g.phone AS customer_phone
+        FROM audit_log a
+        LEFT JOIN wallets w ON w.txn_id = a.entity_id
+        LEFT JOIN guests  g ON g.id     = w.guest_id
+        WHERE a.action = 'wallet_void'
+          AND a.entity_type = 'wallet'
+          AND a.entity_id IS NOT NULL
+          AND a.timestamp >= ? AND a.timestamp < ?
+        ORDER BY a.timestamp DESC
+        LIMIT ?
+      `).all(filters.from, filters.to, limit) as Array<{
+        id: number; timestamp: number; actor: string; entity_id: string; details: string | null;
+        cover_issued: number | null; entry_fee: number | null; expires_at: number | null;
+        customer_name: string | null; customer_phone: string | null;
+      }>;
+
+  // ─── Reservation cover redemptions (the second ledger) ─────────────────
+  const reservationRedemptionRows = !wantRedeemSide
+    ? []
+    : db.prepare(`
+        SELECT
+          cr.id, cr.bill_id, cr.redeemed_amount, cr.redeemed_by, cr.status, cr.timestamp,
+          cr.reservation_id,
+          r.name AS customer_name, r.phone AS customer_phone
+        FROM cover_redemptions cr
+        LEFT JOIN reservations r ON r.id = cr.reservation_id
+        WHERE cr.timestamp >= ? AND cr.timestamp < ?
+        ORDER BY cr.timestamp DESC
+        LIMIT ?
+      `).all(filters.from, filters.to, limit) as Array<{
+        id: string; bill_id: string | null; redeemed_amount: number; redeemed_by: string;
+        status: string; timestamp: number; reservation_id: string;
+        customer_name: string | null; customer_phone: string | null;
+      }>;
+
+  const voided = loadVoidedTxnIds(entryRows.map((w) => w.txn_id));
 
   // ─── Project into TransactionRow ───────────────────────────────────────
   const rows: TransactionRow[] = [];
@@ -202,7 +310,12 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
       id: `entry:${w.txn_id}`,
       kind: 'entry',
       invoice_no: w.txn_id,
-      amount: w.cover_issued,
+      // Money COLLECTED at the door. The row is labelled "Entry & Cover" and
+      // feeds the cashier's drawer reconciliation, so it must be the whole
+      // sum taken from the guest — showing cover_issued alone made a ₹3,000
+      // wallet (₹1,000 entry + ₹2,000 cover) read as ₹2,000 and left the
+      // drawer short by the entry fee on every wallet that carried one.
+      amount: w.entry_fee + w.cover_issued,
       redeemed_by: w.issued_by || '—',
       customer_name: w.customer_name || '—',
       customer_phone: w.customer_phone || '—',
@@ -213,7 +326,50 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
       payment_method: w.payment_method,
       balance: w.balance,
       cover_issued: w.cover_issued,
+      entry_fee: w.entry_fee,
       expires_at: w.expires_at,
+    });
+  }
+
+  for (const v of voidEventRows) {
+    const d = parseDetails(v.details);
+    // voidWallet() logs refund_amount (defaulting to balance_before). That is
+    // the money actually handed back, which is what has to be reconciled.
+    const refunded = d.refund_amount != null ? num(d.refund_amount) : num(d.balance_before);
+    rows.push({
+      id: `void:${v.id}`,
+      kind: 'void',
+      invoice_no: v.entity_id,
+      amount: refunded,
+      redeemed_by: v.actor || '—',
+      customer_name: v.customer_name || '—',
+      customer_phone: v.customer_phone || '—',
+      created_at: v.timestamp,
+      transaction_type: 'Cover Void / Refund',
+      status: 'Voided',
+      wallet_txn_id: v.entity_id,
+      cover_issued: v.cover_issued ?? num(d.cover_issued),
+      entry_fee: v.entry_fee ?? undefined,
+      expires_at: v.expires_at,
+    });
+  }
+
+  for (const c of reservationRedemptionRows) {
+    rows.push({
+      id: `resredeem:${c.id}`,
+      kind: 'reservation_redemption',
+      invoice_no: c.bill_id || `RC${c.id.slice(-6)}`,
+      amount: c.redeemed_amount,
+      redeemed_by: c.redeemed_by || '—',
+      customer_name: c.customer_name || '—',
+      customer_phone: c.customer_phone || '—',
+      created_at: c.timestamp,
+      transaction_type: 'Reservation Cover Redeem',
+      // 'Pending' is literally true: the cashier's settlement queue reads
+      // `redemptions` only, so nothing on this ledger can ever be settled.
+      status: c.status === 'reversed' ? 'Reversed' : 'Pending',
+      // Not a wallet — the reservation id is the entity this row belongs to.
+      wallet_txn_id: c.reservation_id,
     });
   }
 
@@ -262,19 +418,34 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
     entries_count: 0, entries_amount: 0,
     redemptions_count: 0, redemptions_amount: 0,
     settled_amount: 0, pending_amount: 0,
-    voided_count: 0, reversed_count: 0,
+    voided_count: 0, voided_amount: 0, reversed_count: 0,
+    reservation_redemptions_count: 0, reservation_redemptions_amount: 0,
   };
   for (const r of filtered) {
-    if (r.kind === 'entry') {
-      totals.entries_count++;
-      totals.entries_amount += r.amount;
-      if (r.status === 'Voided') totals.voided_count++;
-    } else {
-      totals.redemptions_count++;
-      totals.redemptions_amount += r.amount;
-      if (r.status === 'Settled')  totals.settled_amount += r.amount;
-      if (r.status === 'Pending')  totals.pending_amount += r.amount;
-      if (r.status === 'Reversed') totals.reversed_count++;
+    switch (r.kind) {
+      case 'entry':
+        totals.entries_count++;
+        totals.entries_amount += r.amount;
+        // voided_count is counted off the void EVENT rows below, not off the
+        // 'Voided' status here. The status says "this wallet is voided"
+        // (true from any window); the event says "a refund happened in this
+        // range", which is what the page's "N alterations in this range"
+        // banner claims. Counting both would double-count a same-day void.
+        break;
+      case 'void':
+        totals.voided_count++;
+        totals.voided_amount += r.amount;
+        break;
+      case 'reservation_redemption':
+        totals.reservation_redemptions_count++;
+        if (r.status !== 'Reversed') totals.reservation_redemptions_amount += r.amount;
+        break;
+      default:
+        totals.redemptions_count++;
+        totals.redemptions_amount += r.amount;
+        if (r.status === 'Settled')  totals.settled_amount += r.amount;
+        if (r.status === 'Pending')  totals.pending_amount += r.amount;
+        if (r.status === 'Reversed') totals.reversed_count++;
     }
   }
 
@@ -291,7 +462,8 @@ export function listTransactions(filters: TransactionFilters): TransactionListRe
  */
 export function transactionsToCsv(rows: TransactionRow[]): string {
   const head = [
-    'Invoice No', 'Amount', 'Redeem By', 'Customer Name', 'Customer Mobile',
+    'Invoice No', 'Amount', 'Entry Fee', 'Cover Issued', 'Redeem By',
+    'Customer Name', 'Customer Mobile',
     'Date & Time', 'Transaction', 'Status', 'Wallet Txn', 'Settled By', 'Settled At',
   ];
   const esc = (v: string | number | null | undefined) => {
@@ -302,7 +474,12 @@ export function transactionsToCsv(rows: TransactionRow[]): string {
   const lines = [head.join(',')];
   for (const r of rows) {
     lines.push([
-      r.invoice_no, r.amount, r.redeemed_by, r.customer_name, r.customer_phone,
+      r.invoice_no, r.amount,
+      // Split shown alongside the total so a reconciler can see WHY the
+      // "Entry & Cover" amount is what it is.
+      r.kind === 'entry' ? r.entry_fee ?? '' : '',
+      r.kind === 'entry' ? r.cover_issued ?? '' : '',
+      r.redeemed_by, r.customer_name, r.customer_phone,
       fmtDate(r.created_at), r.transaction_type, r.status, r.wallet_txn_id,
       r.settled_by ?? '', r.settled_at ? fmtDate(r.settled_at) : '',
     ].map(esc).join(','));

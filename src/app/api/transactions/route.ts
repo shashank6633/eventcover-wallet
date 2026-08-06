@@ -27,8 +27,12 @@ export async function GET(req: NextRequest) {
   }
 
   const sp = req.nextUrl.searchParams;
-  const from = Number(sp.get('from')) || (Date.now() - 7 * 24 * 3600 * 1000);
-  const to   = Number(sp.get('to'))   || Date.now() + 1000;
+  // `Number(x) || fallback` treated the timestamp 0 as absent, because 0 is
+  // falsy — so a reconciliation script asking for the complete ledger with
+  // from=0 silently got the last 7 days back, with an HTTP 200 and zero rows,
+  // and reported "no transactions ever" for a venue with a full register.
+  const from = numParam(sp.get('from'), Date.now() - 7 * 24 * 3600 * 1000);
+  const to   = numParam(sp.get('to'),   Date.now() + 1000);
   const kindRaw = sp.get('kind');
   const kind = kindRaw === 'entry' || kindRaw === 'redemption' ? kindRaw : undefined;
   const redeemedBy = sp.get('redeemedBy') || undefined;
@@ -42,4 +46,11 @@ export async function GET(req: NextRequest) {
     range: { from, to },
     ...result,
   });
+}
+
+/** Parse a numeric query param, treating only absent/blank/non-numeric as "use the default". */
+function numParam(raw: string | null, fallback: number): number {
+  if (raw === null || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }

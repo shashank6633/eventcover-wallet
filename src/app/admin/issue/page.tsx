@@ -1,14 +1,18 @@
 'use client';
 
 import { Suspense, useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { formatMoney } from '@/lib/format';
 import { PhoneInput } from '@/components/PhoneInput';
 import { ReservationSearch, type ReservationSearchHit } from '@/components/ReservationSearch';
 import type { Event } from '@/lib/events';
-
-type PaymentMethod = 'cash' | 'upi' | 'card' | 'online' | 'razorpay';
+// Imported, never redeclared. This page used to define its own local
+// PaymentMethod union, which shadowed the canonical one and hid the drift from
+// tsc: it offered a "Razorpay" button that /api/wallets rejects with a 400,
+// at the door, after the money was taken. Importing makes the compiler enforce
+// the contract with the API.
+import type { PaymentMethod } from '@/lib/types';
 
 interface IssueResult {
   txnId: string;
@@ -46,12 +50,16 @@ interface CalcResult {
   message?: string;
 }
 
+/**
+ * Every value here must be in VALID_METHODS in /api/wallets — the type import
+ * above is what guarantees it. 'comp' is intentionally absent: complimentary
+ * entries live in /admin/tickets (Offline Ticketing), not at the entrance.
+ */
 const PAYMENTS: { value: PaymentMethod; label: string }[] = [
   { value: 'cash', label: 'Cash' },
   { value: 'upi', label: 'UPI' },
   { value: 'card', label: 'Card' },
   { value: 'online', label: 'Online' },
-  { value: 'razorpay', label: 'Razorpay' },
 ];
 
 export default function IssueCoverPage() {
@@ -68,6 +76,17 @@ function Loading() {
 
 function IssueClient() {
   const params = useSearchParams();
+  const router = useRouter();
+  /**
+   * The reservation this wallet converts, read straight off the URL and
+   * therefore cleared by rewriting the URL — see resetForNext(). It is NOT
+   * mirrored into state on purpose: two sources of truth here is exactly how
+   * the bug worked. "Issue next wallet" cleared eleven form fields but could
+   * not clear a value that lives in the query string, so every subsequent
+   * walk-in was submitted with reservationId=RES123 and kept re-pointing that
+   * booking's converted_wallet_txn at a stranger, while the blue "Prefilled
+   * from reservation" banner stayed on screen giving the operator no signal.
+   */
   const reservationId = params.get('r') || '';
   const preferredEventId = params.get('eventId') || '';
 
@@ -248,6 +267,16 @@ function IssueClient() {
     setTableId(''); setPaymentMethod('cash');
     setOverride(false); setEntryOverride(''); setCoverOverride('');
     setResult(null); setError(null);
+    // Drop ?r= so the next guest is not stamped onto the previous guest's
+    // booking. The banner is driven by the same param, so it disappears too.
+    // ?eventId= is preserved — it selects which event we're issuing for and
+    // is still correct for the next walk-in.
+    if (reservationId) {
+      router.replace(
+        `/admin/issue${preferredEventId ? `?eventId=${encodeURIComponent(preferredEventId)}` : ''}`,
+        { scroll: false },
+      );
+    }
   }
 
   const currentEvent = events.find((e) => e.id === eventId);
@@ -437,8 +466,15 @@ function IssueClient() {
                 // PNG — best for WhatsApp inline send + fast door scans.
                 // Browser-fetch the image, then open it in a new tab so the
                 // operator can long-press → Save / Share.
+                //
+                // The PIN is NOT in this URL. It used to be (`?qrCodeId=<pin>`)
+                // and the renderer stamped it in 36px under the QR, so the one
+                // image staff forward over WhatsApp carried both factors —
+                // anyone the guest forwarded it to could drain the full cover.
+                // The request line also put the PIN verbatim into every access
+                // log. The PIN reaches the guest in the message TEXT only.
                 try {
-                  const url = `/api/wallets/${encodeURIComponent(result.txnId)}/image?qrCodeId=${encodeURIComponent(result.pin)}`;
+                  const url = `/api/wallets/${encodeURIComponent(result.txnId)}/image`;
                   const res = await fetch(url);
                   if (!res.ok) {
                     const err = await res.json().catch(() => ({ message: 'Failed' }));
@@ -463,12 +499,13 @@ function IssueClient() {
               type="button"
               className="btn btn-secondary flex-1"
               onClick={async () => {
-                // PDF — formal receipt option (multi-page, brandable, printable)
+                // PDF — formal receipt option (multi-page, brandable, printable).
+                // No body: the route derives everything from the txn_id in the
+                // path and documents that it never reads a PIN. Sending one
+                // anyway just put it on the wire for nothing.
                 try {
                   const res = await fetch(`/api/wallets/${encodeURIComponent(result.txnId)}/pass`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ qrCodeId: result.pin }),
                   });
                   if (!res.ok) {
                     const err = await res.json().catch(() => ({ message: 'Failed' }));

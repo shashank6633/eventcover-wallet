@@ -53,8 +53,16 @@ export interface RevenueByEventRow {
 }
 
 export interface DashboardFunnel {
+  /** Affiliate link clicks in range. */
   clicks: number;
+  /** Reservations created (synced_at) in range, any status. */
   reservations: number;
+  /**
+   * Wallets issued against one of the reservations counted above — i.e. a
+   * strict SUBSET of `reservations`, not "all wallets". The renderer prints
+   * value/prevValue as "conversion from previous stage", so this number only
+   * means anything if it is drawn from the previous stage's population.
+   */
   wallets: number;
 }
 
@@ -224,11 +232,87 @@ function computeRevenueByEvent(from: number, to: number, eventId: string | undef
   `).all(from, to, from, to, from, to, ...extra, limit) as RevenueByEventRow[];
 
   // Skip zero-revenue events — they pollute the chart.
-  return rows.filter((r) => (r.revenue || 0) > 0);
+  const withRevenue = rows.filter((r) => (r.revenue || 0) > 0);
+
+  // A single-event view has no residual to show — the operator asked for one
+  // event, and "everything else" isn't part of that question.
+  if (eventId) return withRevenue;
+
+  // ─── Unattributed bucket ────────────────────────────────────────────────
+  // Every subquery above correlates on `event_id = e.id`, so money that has no
+  // event (issueWallet accepts a wallet with no eventId — the door flow falls
+  // back to the global EVENT_DATE config) or points at an event row that has
+  // since been deleted simply vanishes from the chart. The revenue KPI printed
+  // directly above it counts that money, so the bars did not add up to the
+  // number above them: on live data ₹55,250 in the KPI against ₹31,250 of
+  // bars, with ₹24,000 from six event-less wallets and no hint that anything
+  // was missing. Per-event profitability was being judged on 57% of the money.
+  //
+  // Appended last rather than sorted in: it is a residual, not an event, and
+  // BarChart scales every bar off the largest value so its position doesn't
+  // distort the others.
+  //
+  // Caveat that remains: the event rows are still LIMIT-ed to the top `limit`,
+  // so with more revenue-positive events than that the chart is "top N +
+  // unattributed", exactly as the card's own "Top 10" caption says.
+  const orphanSql = (table: string) =>
+    `(${table}.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM events e WHERE e.id = ${table}.event_id))`;
+  const residual = db.prepare(`
+    SELECT (
+      COALESCE((SELECT SUM(w.entry_fee + w.cover_issued) FROM wallets w
+                 WHERE w.issued_at >= ? AND w.issued_at < ? AND ${orphanSql('w')}), 0)
+      + COALESCE((SELECT SUM(t.price) FROM tickets t
+                   WHERE t.created_at >= ? AND t.created_at < ?
+                     AND t.status = 'issued' AND t.complimentary = 0 AND ${orphanSql('t')}), 0)
+      + COALESCE((SELECT SUM(p.amount) FROM payments p
+                   WHERE p.created_at >= ? AND p.created_at < ?
+                     AND p.status = 'captured' AND ${orphanSql('p')}), 0)
+    ) AS revenue
+  `).get(from, to, from, to, from, to) as { revenue: number };
+
+  if ((residual.revenue || 0) > 0) {
+    withRevenue.push({
+      eventId: '',
+      name: '(Unattributed)',
+      eventDate: '',
+      revenue: residual.revenue,
+    });
+  }
+  return withRevenue;
 }
 
 // ─── funnel ────────────────────────────────────────────────────────────────
 
+/**
+ * Funnel stages.
+ *
+ * The wallet stage used to be `COUNT(*) FROM wallets` in the same window —
+ * three unrelated COUNTs stacked as if they were stages. FunnelChart renders
+ * each pair as "conversion from previous stage", so on live data that printed
+ * "59% of reservations convert to wallets" (13 wallets ÷ 22 unrelated
+ * reservations) when in fact ONE of those 13 wallets came from a reservation.
+ * A funnel percentage between two populations that don't overlap is not an
+ * approximation, it is a fabricated number, and it is the number the owner
+ * uses to decide whether the reservation channel is working.
+ *
+ * The wallet stage is now the reservations counted in stage 2 that actually
+ * converted (wallets.reservation_id — set by issueWallet, the authoritative
+ * link; reservations.converted_wallet_txn is written best-effort in a
+ * try/catch and can silently miss). Cohort semantics: the wallet is counted
+ * whenever it was issued, because the question is "of the reservations taken
+ * in this window, how many turned into a wallet". That also makes
+ * stage3 <= stage2 by construction, so the chart can never draw a longer bar
+ * for a later stage.
+ *
+ * KNOWN RESIDUAL — the clicks stage is still not a parent of reservations:
+ * `reservations` has no affiliate_id/affiliate_code column (affiliate
+ * attribution exists on tickets only), so there is no click → reservation
+ * link to filter on in this schema. Making stage 1 honest needs either that
+ * column or a relabel in the renderer (src/components/AnalyticsDashboard.tsx
+ * hardcodes the stage labels, and FunnelChart.tsx:30 scales every bar against
+ * stage 1, so with 0 clicks the reservations bar computes a >100% width).
+ * Both live outside this file.
+ */
 function computeFunnel(from: number, to: number, eventId: string | undefined): DashboardFunnel {
   const db = getDb();
   const extraSql = eventId ? 'AND event_id = ?' : '';
@@ -244,9 +328,19 @@ function computeFunnel(from: number, to: number, eventId: string | undefined): D
     WHERE synced_at >= ? AND synced_at < ? ${extraSql}
   `).get(from, to, ...extra) as { c: number }).c || 0;
 
+  // Same reservation population as the stage above, filtered to the ones a
+  // wallet points back at. Aliased explicitly: `event_id` unqualified would
+  // silently bind to reservations inside the subquery while reading like it
+  // applies to wallets.
+  const walletResEventSql = eventId ? 'AND r.event_id = ?' : '';
   const wallets = (db.prepare(`
-    SELECT COUNT(*) AS c FROM wallets
-    WHERE issued_at >= ? AND issued_at < ? ${extraSql}
+    SELECT COUNT(*) AS c FROM wallets w
+    WHERE w.reservation_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM reservations r
+         WHERE r.id = w.reservation_id
+           AND r.synced_at >= ? AND r.synced_at < ? ${walletResEventSql}
+      )
   `).get(from, to, ...extra) as { c: number }).c || 0;
 
   return { clicks, reservations, wallets };

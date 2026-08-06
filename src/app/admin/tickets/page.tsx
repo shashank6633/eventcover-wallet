@@ -301,8 +301,14 @@ export default function OfflineTicketingPage() {
         const label = isCover
           ? `Cover ₹${(w.balance ?? 0).toLocaleString('en-IN')}`
           : 'Entry pass';
+        // "queued", not "sent": the send is deliberately fire-and-forget so it
+        // can't delay this response, which means the outcome isn't known yet.
+        // It can still skip downstream (no phone number on the wallet, Interakt
+        // not configured, or — for an entry-only pass — no 2-variable template
+        // approved yet). Check Settings → WhatsApp, or the audit log, for what
+        // actually went out.
         flash += w.whatsappQueued
-          ? ` · ${label} sent on WhatsApp`
+          ? ` · ${label} queued for WhatsApp`
           : ` · ${label} · QR Code ID ${w.pin.slice(-4)}`;
       } else {
         flash += ` (wallet not auto-issued — visit Issue Cover)`;

@@ -13,6 +13,15 @@
  * regardless of phone DPI).
  *
  * Dimensions: 800×1200 (portrait 2:3, fits WhatsApp media well).
+ *
+ * THE PIN IS NEVER DRAWN HERE — same rule the A6 PDF sibling (pass.ts) already
+ * enforces, and for the same reason: this image is the artifact staff forward
+ * over WhatsApp and guests screenshot. The QR encodes the txn_id; the PIN is
+ * the single factor that stops a copied QR from draining the bar credit, so
+ * the two must never ride in one file. `qrCodeId` is still accepted so callers
+ * keep compiling, and is deliberately ignored — an ignored field cannot be
+ * pushed onto the artifact by a route this module does not control (the public
+ * token route reads it straight out of an unencrypted token payload).
  */
 import QRCode from 'qrcode';
 import sharp from 'sharp';
@@ -27,7 +36,20 @@ export interface PassImageInput {
   pax?: number;
   venueName?: string;
   venueLogo?: string;       // data URL or http(s) URL — optional
-  qrCodeId?: string;        // human-readable wallet code, displayed below QR
+  /**
+   * The plaintext PIN under an older alias. Still accepted so existing callers
+   * keep compiling, but deliberately NOT rendered — see the file header.
+   */
+  qrCodeId?: string;
+  /**
+   * True when the wallet carries redeemable bar credit (wallets.cover_issued
+   * > 0). Drives the pass label, the amount line and the footer, because an
+   * entry-only ticket must not be headed "COVER PASS" over "Cover loaded ₹0".
+   * Defaults to `coverAmount > 0`, so every existing caller — all of which
+   * already pass cover_issued as coverAmount — gets the right copy without
+   * changing. Mirrors PassPdfInput.hasCover in pass.ts.
+   */
+  hasCover?: boolean;
   expiresAt?: number | null;
   /**
    * Optional per-event design override. Accepts a partial TicketDesign, a
@@ -68,6 +90,19 @@ export async function generatePassImage(input: PassImageInput): Promise<Buffer> 
   const cover = formatINR(input.coverAmount);
   const pax = input.pax && input.pax > 1 ? `${input.pax} guests` : '1 guest';
   const expires = input.expiresAt ? formatExpiry(input.expiresAt) : '';
+
+  // Tier switch, same shape as generatePassPdf. An explicit hasCover wins so a
+  // caller that has the wallet row can override; otherwise the amount is the
+  // honest signal.
+  const hasCover = input.hasCover ?? input.coverAmount > 0;
+  const passLabel = hasCover ? 'COVER PASS' : 'ENTRY PASS';
+  // "1 guest · Cover loaded ₹0" is a promise the pass cannot keep.
+  const detailLine = hasCover
+    ? `${pax} · Cover loaded ${cover}`
+    : `${pax} · Entry pass — no bar credit`;
+  const footerLine = hasCover
+    ? 'Show this at the door · Spending bar credit needs your WhatsApp PIN'
+    : 'Show this at the door · Entry only — no bar credit, no PIN';
 
   // QR contents: the txn id — captain's scanner reads + redeems
   const qrSvgString = await QRCode.toString(input.txnId, {
@@ -116,7 +151,7 @@ export async function generatePassImage(input: PassImageInput): Promise<Buffer> 
   <text x="${W / 2}" y="95" text-anchor="middle"
         font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"
         font-size="18" font-weight="500" fill="#FFFFFF" opacity="0.85" letter-spacing="6">
-    COVER PASS
+    ${escapeXml(passLabel)}
   </text>` : ''}
 
   <!-- Event line -->
@@ -139,17 +174,9 @@ export async function generatePassImage(input: PassImageInput): Promise<Buffer> 
     ${qrInner}
   </g>
 
-  ${input.qrCodeId ? `
-  <text x="${W / 2}" y="${qrY + qrSize + 75}" text-anchor="middle"
-        font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,monospace"
-        font-size="36" font-weight="700" fill="${INK}" letter-spacing="6">
-    ${escapeXml(input.qrCodeId)}
-  </text>
-  <text x="${W / 2}" y="${qrY + qrSize + 100}" text-anchor="middle"
-        font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"
-        font-size="12" font-weight="500" fill="${MUTED}" letter-spacing="4">
-    QR CODE ID
-  </text>` : ''}
+  <!-- No code block under the QR: this slot used to render input.qrCodeId,
+       which every live caller filled with the guest's plaintext PIN. See the
+       file header — the PIN never shares an artifact with the QR. -->
 
   <!-- Guest info grid -->
   <g transform="translate(0, ${qrY + qrSize + 145})">
@@ -161,7 +188,7 @@ export async function generatePassImage(input: PassImageInput): Promise<Buffer> 
     <text x="${W / 2}" y="32" text-anchor="middle"
           font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"
           font-size="16" font-weight="400" fill="${MUTED}">
-      ${escapeXml(pax)} · Cover loaded ${escapeXml(cover)}
+      ${escapeXml(detailLine)}
     </text>
     ${expires ? `
     <text x="${W / 2}" y="58" text-anchor="middle"
@@ -176,7 +203,7 @@ export async function generatePassImage(input: PassImageInput): Promise<Buffer> 
   <text x="${W / 2}" y="${H - 42}" text-anchor="middle"
         font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"
         font-size="13" font-weight="500" fill="${MUTED}">
-    Show this at the door · No PIN required to scan
+    ${escapeXml(footerLine)}
   </text>
   <text x="${W / 2}" y="${H - 22}" text-anchor="middle"
         font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif"

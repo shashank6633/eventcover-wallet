@@ -75,40 +75,71 @@ export interface AnalyticsResult {
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function loadVoidedTxnIdsAll(): Set<string> {
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT DISTINCT entity_id
-    FROM audit_log
-    WHERE action = 'wallet_void' AND entity_type = 'wallet' AND entity_id IS NOT NULL
-  `).all() as { entity_id: string }[];
-  return new Set(rows.map((r) => r.entity_id));
-}
-
-function loadVoidedTxnIdsRange(from: number, to: number): Set<string> {
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT DISTINCT entity_id
-    FROM audit_log
-    WHERE action = 'wallet_void' AND entity_type = 'wallet'
-      AND timestamp >= ? AND timestamp < ?
-      AND entity_id IS NOT NULL
-  `).all(from, to) as { entity_id: string }[];
-  return new Set(rows.map((r) => r.entity_id));
+/**
+ * Money columns are SQLite REAL, so a plain SUM of fractional covers returns
+ * things like 4367.339999999999. The KPI tiles format for display and hide it,
+ * but the raw JSON is what an external reconciliation script compares against —
+ * and the same concept must not serialise as 36400 on one endpoint and
+ * 36399.999999999996 on another (dashboard.ts already applies .toFixed(2) to
+ * its unredeemed figure; these did not).
+ */
+function round2(n: number): number {
+  return Math.round((Number(n) || 0) * 100) / 100;
 }
 
 /**
- * Sum cover_issued for a set of voided wallets — what would otherwise
- * have been redeemable. Drives "Edited Amount".
+ * Wallets that are a SECOND representation of money another stream already
+ * counts, and must therefore not be added again.
+ *
+ * POST /api/tickets writes the grand total to tickets.price and then, in the
+ * same handler, issues a wallet for the same rupees (entry_fee + cover_issued)
+ * and stamps the link into tickets.wallet_txn_id. /api/payments/verify does the
+ * same for Razorpay and writes the wallet id into payments.txn_id. Summing all
+ * three streams as if they were disjoint reported every ticket sale and every
+ * online booking at exactly 2x: ₹3,000 collected showed as ₹6,000.
+ *
+ * The ticket / payment row is the one kept — it is what the venue actually
+ * collected — and the derived wallet is dropped. Only rows the revenue queries
+ * genuinely count are used to exclude, so a cancelled ticket or an uncaptured
+ * payment can never silently erase its wallet's revenue.
+ *
+ * Deliberately NOT applied to cover_issued / amountIssued / leftOver: the bar
+ * credit on a ticket-issued wallet is a real liability regardless of which
+ * stream paid for it.
  */
-function sumVoidedCover(txnIds: string[]): number {
-  if (txnIds.length === 0) return 0;
+const TICKET_LINKED_WALLETS = `
+  SELECT wallet_txn_id FROM tickets
+   WHERE wallet_txn_id IS NOT NULL AND status = 'issued' AND complimentary = 0
+`;
+const PAYMENT_LINKED_WALLETS = `
+  SELECT txn_id FROM payments
+   WHERE txn_id IS NOT NULL AND status = 'captured' AND verified_at IS NOT NULL
+`;
+
+/**
+ * Total actually refunded by voids in scope — drives "Edited Amount".
+ *
+ * Was SUM(wallets.cover_issued) over every voided wallet, which overstates any
+ * wallet that had already been partly spent by exactly the amount the guest
+ * legitimately drank: a ₹3,000 cover with ₹1,000 drunk and ₹2,000 refunded
+ * reported ₹3,000, so a manager auditing staff for suspicious voids could not
+ * tell a full refund from a partial one. voidWallet already records the true
+ * figure in the audit row, so read that; balance_before is the fallback for
+ * older rows, since refund_amount defaults to it.
+ */
+function sumVoidedRefunds(from?: number, to?: number): number {
   const db = getDb();
-  const placeholders = txnIds.map(() => '?').join(',');
+  const inRange = from !== undefined && to !== undefined;
   const row = db.prepare(`
-    SELECT COALESCE(SUM(cover_issued), 0) AS total
-    FROM wallets WHERE txn_id IN (${placeholders})
-  `).get(...txnIds) as { total: number };
+    SELECT COALESCE(SUM(COALESCE(
+             json_extract(details, '$.refund_amount'),
+             json_extract(details, '$.balance_before'),
+             0
+           )), 0) AS total
+    FROM audit_log
+    WHERE action = 'wallet_void' AND entity_type = 'wallet' AND entity_id IS NOT NULL
+    ${inRange ? 'AND timestamp >= ? AND timestamp < ?' : ''}
+  `).get(...(inRange ? [from!, to!] : [])) as { total: number };
   return row.total || 0;
 }
 
@@ -136,12 +167,26 @@ function computeKpis(from: number | undefined, to: number | undefined): Analytic
     ${walletWhere}
   `).get(...walletParams) as { entry_total: number; cover_total: number; wallet_count: number; unique_guests: number };
 
-  // Payment-mode breakdown (entry+cover bundled — the amount paid for the wallet)
+  // Revenue side of the same wallets, minus the ones a counted ticket already
+  // represents (see TICKET_LINKED_WALLETS). Payment-linked wallets are NOT
+  // excluded here: this scope does not sum the payments table at all, so the
+  // wallet row is the only place an online booking's money is counted.
+  const walletRevWhere = `${walletWhere ? `${walletWhere} AND` : 'WHERE'} txn_id NOT IN (${TICKET_LINKED_WALLETS})`;
+  const walletRev = db.prepare(`
+    SELECT COALESCE(SUM(entry_fee + cover_issued), 0) AS total
+    FROM wallets
+    ${walletRevWhere}
+  `).get(...walletParams) as { total: number };
+
+  // Payment-mode breakdown (entry+cover bundled — the amount paid for the wallet).
+  // Same exclusion, otherwise a ₹3,000 ticket lands in BOTH the cash bucket
+  // (via its wallet) and the ticket bucket, and the breakdown stops summing to
+  // Total Incoming.
   const payRows = db.prepare(`
     SELECT payment_method,
            COALESCE(SUM(entry_fee + cover_issued), 0) AS amount
     FROM wallets
-    ${walletWhere}
+    ${walletRevWhere}
     GROUP BY payment_method
   `).all(...walletParams) as { payment_method: PaymentMethod; amount: number }[];
 
@@ -176,26 +221,26 @@ function computeKpis(from: number | undefined, to: number | undefined): Analytic
     FROM tickets
     ${ticketWhere}
   `).get(...walletParams) as { total: number; count: number };
-  paymentBreakdown.ticket = ticketAgg.total || 0;
+  paymentBreakdown.ticket = round2(ticketAgg.total || 0);
+  for (const k of Object.keys(paymentBreakdown) as (keyof typeof paymentBreakdown)[]) {
+    paymentBreakdown[k] = round2(paymentBreakdown[k]);
+  }
 
   // Voided wallets — for Edited Amount
-  const voided = inRange
-    ? Array.from(loadVoidedTxnIdsRange(from!, to!))
-    : Array.from(loadVoidedTxnIdsAll());
-  const voidedCover = sumVoidedCover(voided);
+  const voidedRefunds = inRange ? sumVoidedRefunds(from!, to!) : sumVoidedRefunds();
 
-  const amountIssued = walletAgg.cover_total || 0;
-  const totalRedeems = redeemAgg.total || 0;
-  const editedAmount = voidedCover + (reversedAgg.total || 0);
+  const amountIssued = round2(walletAgg.cover_total || 0);
+  const totalRedeems = round2(redeemAgg.total || 0);
+  const editedAmount = round2(voidedRefunds + (reversedAgg.total || 0));
 
   return {
     totalCustomers: walletAgg.unique_guests || 0,
-    totalIncoming: (walletAgg.entry_total || 0) + (walletAgg.cover_total || 0) + (ticketAgg.total || 0),
-    totalCoverCharge: walletAgg.cover_total || 0,
+    totalIncoming: round2((walletRev.total || 0) + (ticketAgg.total || 0)),
+    totalCoverCharge: round2(walletAgg.cover_total || 0),
     amountIssued,
     topUpsPreload: 0,
     totalRedeems,
-    leftOver: Math.max(0, amountIssued - totalRedeems),
+    leftOver: round2(Math.max(0, amountIssued - totalRedeems)),
     editedAmount,
     paymentBreakdown,
   };
@@ -317,6 +362,58 @@ function listTransactionFeed(filters: AnalyticsFilters): AnalyticsTxnRow[] {
     });
   }
 
+  // Voids (refunds) and top-ups.
+  //
+  // AnalyticsTxnKind has always declared 'Void' and 'Top Up', and
+  // AnalyticsLedger ships a rose Void pill — but nothing ever emitted either,
+  // so the venue's cashier-style register simply had no line item for a
+  // refund. A host who voided a ₹6,000 cover saw only the original Issue row
+  // for ₹8,000 and nothing else. Neither event writes a row of its own
+  // (voidWallet mutates the wallet in place; a top-up increments the balance),
+  // so the audit log is the source of truth for both.
+  const auditWhere = inRange ? 'AND a.timestamp >= ? AND a.timestamp < ?' : '';
+  const auditParams = inRange ? [filters.from!, filters.to!, limit] : [limit];
+  const walletEvents = db.prepare(`
+    SELECT a.entity_id AS txn_id, a.actor, a.timestamp, a.action, a.details,
+           w.payment_method,
+           g.name AS customer_name, g.phone AS customer_phone
+      FROM audit_log a
+      LEFT JOIN wallets w ON w.txn_id = a.entity_id
+      LEFT JOIN guests  g ON g.id = w.guest_id
+     WHERE a.action IN ('wallet_void', 'wallet_topup_captured')
+       AND a.entity_type = 'wallet' AND a.entity_id IS NOT NULL
+       ${auditWhere}
+     ORDER BY a.timestamp DESC
+     LIMIT ?
+  `).all(...auditParams) as Array<{
+    txn_id: string; actor: string | null; timestamp: number; action: string;
+    details: string | null; payment_method: PaymentMethod | null;
+    customer_name: string | null; customer_phone: string | null;
+  }>;
+
+  for (const e of walletEvents) {
+    let detail: Record<string, unknown> = {};
+    try { detail = e.details ? JSON.parse(e.details) as Record<string, unknown> : {}; } catch { /* legacy free-text details */ }
+    const isVoid = e.action === 'wallet_void';
+    // Void amount is what was actually handed back, not the whole cover.
+    const amount = Number(
+      isVoid ? (detail.refund_amount ?? detail.balance_before ?? 0) : (detail.amount ?? 0),
+    ) || 0;
+    rows.push({
+      id: `${isVoid ? 'void' : 'topup'}:${e.txn_id}:${e.timestamp}`,
+      invoice_no: e.txn_id,
+      customer_name: e.customer_name || '—',
+      customer_phone: e.customer_phone || '—',
+      amount: round2(amount),
+      timestamp: e.timestamp,
+      kind: isVoid ? 'Void' : 'Top Up',
+      payment_mode: isVoid ? 'REFUND' : (e.payment_method || 'ONLINE').toUpperCase(),
+      employee_name: e.actor || '—',
+      entity_ref: e.txn_id,
+      entity_type: 'wallet',
+    });
+  }
+
   // Filter + sort
   let filtered = rows;
   if (filters.employee && filters.employee !== 'all') {
@@ -422,10 +519,16 @@ export function getKpis(filters: DashboardRangeFilters = {}): DashboardKpis {
   const { from, to } = resolveDashboardRange(filters);
 
   // Revenue stream 1: wallets issued in-range — entry + cover charged.
+  // Wallets that a counted ticket or a captured payment already represents are
+  // excluded here (see TICKET_LINKED_WALLETS / PAYMENT_LINKED_WALLETS); this
+  // scope sums all three streams, so without the exclusion every ticket sale
+  // and every online booking was counted twice.
   const walletRev = db.prepare(`
     SELECT COALESCE(SUM(entry_fee + cover_issued), 0) AS total
     FROM wallets
     WHERE issued_at >= ? AND issued_at < ?
+      AND txn_id NOT IN (${TICKET_LINKED_WALLETS})
+      AND txn_id NOT IN (${PAYMENT_LINKED_WALLETS})
   `).get(from, to) as { total: number };
 
   // Revenue stream 2: tickets issued in-range, paid (non-complimentary).
@@ -437,9 +540,9 @@ export function getKpis(filters: DashboardRangeFilters = {}): DashboardKpis {
   `).get(from, to) as { total: number };
 
   // Revenue stream 3: Razorpay payments captured in-range. These represent
-  // paid online bookings — distinct from wallets (offline cover) and tickets
-  // (offline guestlist). No dedupe needed: a captured payment does not also
-  // appear as a wallet row in the current data model.
+  // paid online bookings. A captured payment DOES also appear as a wallet row —
+  // /api/payments/verify issues one for the same money and writes the wallet id
+  // back into payments.txn_id — which is exactly why stream 1 excludes it.
   const paymentRev = db.prepare(`
     SELECT COALESCE(SUM(amount), 0) AS total
     FROM payments
@@ -448,8 +551,9 @@ export function getKpis(filters: DashboardRangeFilters = {}): DashboardKpis {
       AND verified_at >= ? AND verified_at < ?
   `).get(from, to) as { total: number };
 
-  const totalRevenue =
-    (walletRev.total || 0) + (ticketRev.total || 0) + (paymentRev.total || 0);
+  const totalRevenue = round2(
+    (walletRev.total || 0) + (ticketRev.total || 0) + (paymentRev.total || 0),
+  );
 
   // Active wallets — still-redeemable wallets issued in-range.
   const active = db.prepare(`
@@ -519,10 +623,17 @@ export function getRevenueByEvent(filters: RevenueByEventFilters = {}): RevenueB
   // Pre-aggregate each revenue stream by event_id, then UNION ALL and sum.
   // LEFT JOIN events at the end so events with zero revenue in-range are
   // excluded (they wouldn't appear in any of the three sub-queries).
+  //
+  // The wallets leg drops rows a counted ticket or captured payment already
+  // represents — the same dedupe getKpis applies — otherwise every ticket sale
+  // and online booking inflates its event's bar by 100%. wallet_count keeps
+  // counting ALL wallets for the event: a ticket-issued guest is still a guest.
   const rows = db.prepare(`
     WITH per_event AS (
       SELECT event_id,
-             SUM(entry_fee + cover_issued) AS revenue,
+             SUM(CASE WHEN txn_id NOT IN (${TICKET_LINKED_WALLETS})
+                       AND txn_id NOT IN (${PAYMENT_LINKED_WALLETS})
+                      THEN entry_fee + cover_issued ELSE 0 END) AS revenue,
              COUNT(*) AS wallet_count
         FROM wallets
        WHERE event_id IS NOT NULL
@@ -564,7 +675,7 @@ export function getRevenueByEvent(filters: RevenueByEventFilters = {}): RevenueB
      LIMIT ?
   `).all(from, to, from, to, from, to, limit) as RevenueByEventRow[];
 
-  return rows;
+  return rows.map((r) => ({ ...r, revenue: round2(r.revenue) }));
 }
 
 // ─── Conversion funnel ──────────────────────────────────────────────────────
