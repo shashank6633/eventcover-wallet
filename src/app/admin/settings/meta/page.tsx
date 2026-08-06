@@ -27,6 +27,9 @@ export default function MetaSettingsPage() {
   const [accessToken, setAccessToken] = useState<string>('');
   const [accessTokenEdited, setAccessTokenEdited] = useState<boolean>(false);
   const [testEventCode, setTestEventCode] = useState<string>('');
+  // The value actually PERSISTED. The banner keys off this, not the input,
+  // so typing a code doesn't warn before it can do any harm.
+  const [savedTestEventCode, setSavedTestEventCode] = useState<string>('');
   const [stateLoaded, setStateLoaded] = useState(false);
 
   const [saving, setSaving] = useState(false);
@@ -60,8 +63,39 @@ export default function MetaSettingsPage() {
       setPixelId(d.pixelId || '');
       setHasAccessToken(!!d.hasAccessToken);
       setTestEventCode(d.testEventCode || '');
+      setSavedTestEventCode(d.testEventCode || '');
       setStateLoaded(true);
     });
+  }
+
+  /**
+   * Clear the test code and save immediately.
+   *
+   * Separate from the form's save() so the banner is a one-click fix: an
+   * operator who has just been told real conversions are being discarded
+   * should not have to find the right field, blank it and remember to submit.
+   * Sends only the pixel id + empty code — never touches the access token,
+   * which the API leaves alone when the key is absent.
+   */
+  async function clearTestCode() {
+    setSaving(true); setError(null); setFlash(null);
+    try {
+      const res = await fetch('/api/settings/meta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pixelId: pixelId.trim(), testEventCode: '' }),
+      });
+      const d = await res.json();
+      if (!d.ok) { setError(d.message || 'Could not clear the test code.'); return; }
+      setTestEventCode(d.testEventCode || '');
+      setSavedTestEventCode(d.testEventCode || '');
+      setFlash('Test code cleared — conversions now go to your live dataset.');
+      setTimeout(() => setFlash(null), 5000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Network error.');
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function save(e: React.FormEvent) {
@@ -83,6 +117,7 @@ export default function MetaSettingsPage() {
       setPixelId(d.pixelId || '');
       setHasAccessToken(!!d.hasAccessToken);
       setTestEventCode(d.testEventCode || '');
+      setSavedTestEventCode(d.testEventCode || '');
       setAccessToken('');
       setAccessTokenEdited(false);
       // A save invalidates prior test-success state (config may have changed)
@@ -200,6 +235,47 @@ export default function MetaSettingsPage() {
       {error && (
         <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 px-3 py-2 text-sm">
           {error}
+        </div>
+      )}
+
+      {/*
+        Test-mode warning.
+
+        A test event code is not a harmless debug flag: it is attached to EVERY
+        real conversion (ticket sale, paid booking, reservation), and Meta then
+        routes all of them into the Test Events tab, deliberately excluded from
+        the dataset, reporting and ad optimisation. A venue can sell out while
+        Ads Manager reports zero purchases, with nothing obviously wrong.
+        Keyed off the SAVED value, not the input, so typing a code doesn't warn
+        before it can actually do harm.
+      */}
+      {stateLoaded && savedTestEventCode.trim() !== '' && (
+        <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+          <div className="flex items-start gap-2.5">
+            <span aria-hidden className="text-amber-600 text-base leading-none mt-0.5">⚠</span>
+            <div className="text-sm text-amber-900">
+              <div className="font-semibold">
+                Test mode is ON — real conversions are being kept out of your dataset
+              </div>
+              <p className="mt-1 text-amber-800">
+                Every sale, booking and reservation is being tagged{' '}
+                <span className="font-mono font-semibold">{savedTestEventCode}</span> and sent to
+                Meta&apos;s <strong>Test Events</strong> tab only. They will <strong>not</strong>{' '}
+                appear in Ads Manager and <strong>cannot</strong> be used to optimise campaigns.
+              </p>
+              <p className="mt-1.5 text-amber-800">
+                Use this only while debugging. Clear the field below and save to go live.
+              </p>
+              <button
+                type="button"
+                onClick={clearTestCode}
+                disabled={saving}
+                className="mt-2.5 rounded-md border border-amber-400 bg-white px-3 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+              >
+                {saving ? 'Clearing…' : 'Clear test code & go live'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
